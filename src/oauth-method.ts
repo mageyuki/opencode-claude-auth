@@ -39,6 +39,7 @@ export interface OAuthDeps {
   refreshIfNeeded: (
     account: ClaudeAccount,
     thresholdMs?: number,
+    ownSourceOnly?: boolean,
   ) => Promise<ClaudeCredentials | null>
   setActiveAccountSource: (source: string) => void
   saveAccountSource: (source: string) => void
@@ -181,20 +182,20 @@ export async function refreshOAuthCredential(
       expiresAt: value.expires,
     },
   }
-  const refreshed = await deps.refreshIfNeeded(account, 5 * 60_000)
+  // The coordinator may lend credentials to request callers. Its source-only
+  // mode also filters shared in-flight results and already-borrowed state.
+  const refreshed = await deps.refreshIfNeeded(account, 5 * 60_000, true)
   // A transient outage or refresh cooldown must not invalidate a token that
   // remains usable. Never claim an expired token is valid or extend its expiry.
   const usable =
     refreshed ??
-    (account.credentials.expiresAt > Date.now()
-      ? account.credentials
-      : value.expires > Date.now()
-        ? {
-            accessToken: value.access,
-            refreshToken: value.refresh,
-            expiresAt: value.expires,
-          }
-        : null)
+    (value.expires > Date.now()
+      ? {
+          accessToken: value.access,
+          refreshToken: value.refresh,
+          expiresAt: value.expires,
+        }
+      : null)
   if (!usable || usable.expiresAt <= Date.now())
     throw new Error(
       "Claude OAuth refresh failed. Run `claude` to re-authenticate.",

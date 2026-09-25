@@ -44,7 +44,13 @@ const accountCacheMap = new Map<
   string,
   { creds: ClaudeCredentials; cachedAt: number }
 >()
-const inFlightRefreshes = new Map<string, Promise<ClaudeCredentials | null>>()
+// Capture provenance with the result, not by inspecting a mutable account
+// after awaiting it: a joiner may hold a different object for the same source.
+type CoordinatedRefreshResult = {
+  creds: ClaudeCredentials
+  borrowed?: boolean
+} | null
+const inFlightRefreshes = new Map<string, Promise<CoordinatedRefreshResult>>()
 
 // Accounts currently running on credentials borrowed from another account.
 // Those tokens belong to the lender: they must never be used as this
@@ -454,13 +460,17 @@ function refreshViaCli(configDir?: string, requireConfigDir = false): boolean {
  * the account resolution (via getActiveAccount()) stays correct regardless
  * of threshold, so this always operates on the currently active account
  * unless one is explicitly passed in.
+ * Durable credential callers must set `ownSourceOnly`: request-path lending
+ * remains available by default, but must not be persisted as this source.
  */
 export async function refreshIfNeeded(
   account?: ClaudeAccount,
   thresholdMs = 60_000,
+  ownSourceOnly = false,
 ): Promise<ClaudeCredentials | null> {
   const target = account ?? getActiveAccount()
   if (!target) return null
+  let own = borrowedCredentialAccounts.has(target) ? null : target.credentials
 
   // Pick up credentials replaced externally — cswap switching accounts, the
   // claude CLI in another terminal, or a second OpenCode instance. This was
@@ -496,12 +506,16 @@ export async function refreshIfNeeded(
   try {
     const stored = refreshAccount(target.source, target.configDir)
     const now = Date.now()
+    // Even when a near-expiry own token cannot replace a healthy loan on the
+    // request path, it can still serve the durable source-specific caller.
+    if (stored && !own) own = stored
     if (
       stored &&
       (stored.expiresAt > now + 60_000 ||
         target.credentials.expiresAt <= now + 60_000)
     ) {
       target.credentials = stored
+      own = stored
       // Read from this account's own source, so what it returned is this
       // account's own credentials — it is no longer running on a lender's.
       borrowedCredentialAccounts.delete(target)
@@ -513,8 +527,14 @@ export async function refreshIfNeeded(
     })
   }
 
+  const resolve = (result: CoordinatedRefreshResult) => {
+    if (result && (!ownSourceOnly || !result.borrowed)) return result.creds
+    return ownSourceOnly && own && own.expiresAt > Date.now() ? own : null
+  }
   const creds = target.credentials
-  if (creds.expiresAt > Date.now() + thresholdMs) return creds
+  if (creds.expiresAt > Date.now() + thresholdMs) {
+    return resolve({ creds, borrowed: borrowedCredentialAccounts.has(target) })
+  }
 
   // If a recent refresh was rate-limited, don't re-hit the endpoint until the
   // cooldown clears — adopt a sibling instance's / the CLI's fresh token if one
@@ -531,7 +551,7 @@ export async function refreshIfNeeded(
       source: target.source,
       until: getRefreshCooldownUntil(target.source),
     })
-    return null
+    return resolve(null)
   }
 
   // The proactive sync timer calls this directly while the request path
@@ -541,7 +561,7 @@ export async function refreshIfNeeded(
   const inFlight = inFlightRefreshes.get(target.source)
   if (inFlight) {
     log("refresh_joined", { source: target.source })
-    return inFlight
+    return resolve(await inFlight)
   }
 
   // Cross-process single-flight: only one OpenCode instance / the CLI should
@@ -556,7 +576,7 @@ export async function refreshIfNeeded(
     // ages out by TTL). Defer rather than refresh lock-free, so we don't
     // recreate the burst the lock exists to prevent — the request-level wait
     // loop and the lock TTL drive eventual progress.
-    return null
+    return resolve(null)
   }
 
   const pending = (async () => {
@@ -568,7 +588,7 @@ export async function refreshIfNeeded(
   })()
   inFlightRefreshes.set(target.source, pending)
   try {
-    return await pending
+    return resolve(await pending)
   } finally {
     inFlightRefreshes.delete(target.source)
   }
@@ -643,7 +663,7 @@ async function waitForAdopt(
 async function performRefresh(
   target: ClaudeAccount,
   creds: ClaudeCredentials,
-): Promise<ClaudeCredentials | null> {
+): Promise<CoordinatedRefreshResult> {
   if (borrowedCredentialAccounts.has(target)) {
     return refreshBorrowedAccount(target)
   }
@@ -679,7 +699,7 @@ async function performRefresh(
         // the validated re-read — is tracked as a follow-up.
         log("refresh_writeback_failed", { source: target.source })
       }
-      return outcome.creds
+      return { creds: outcome.creds }
     }
 
     if (outcome.kind === "transient") {
@@ -698,16 +718,17 @@ async function performRefresh(
         cooldownMs,
       })
       const adopted = adoptFreshFromSource(target, creds.accessToken)
-      if (adopted) return adopted
+      if (adopted) return { creds: adopted }
       // Keep serving still-usable credentials on the proactive path.
-      if (creds.expiresAt > Date.now() + CLI_FALLBACK_THRESHOLD_MS) return creds
+      if (creds.expiresAt > Date.now() + CLI_FALLBACK_THRESHOLD_MS)
+        return { creds }
       // Borrow a sibling account's still-valid token rather than spawning the
       // claude CLI, which hits the same rate-limited endpoint.
       const borrowed = tryFallbackAccount(target.source)
       if (borrowed) {
         target.credentials = borrowed
         borrowedCredentialAccounts.add(target)
-        return borrowed
+        return { creds: borrowed, borrowed: true }
       }
       return null
     }
@@ -736,7 +757,7 @@ async function performRefresh(
       reason: "credentials still usable",
       expiresIn: creds.expiresAt - Date.now(),
     })
-    return creds
+    return { creds }
   }
 
   // Every OpenCode instance refreshes independently, and a rotation
@@ -764,7 +785,7 @@ async function performRefresh(
     ) {
       target.credentials = stored
       log("refresh_adopted_external", { source: target.source })
-      return stored
+      return { creds: stored }
     }
   }
 
@@ -778,7 +799,7 @@ async function performRefresh(
     if (fallback) {
       target.credentials = fallback
       borrowedCredentialAccounts.add(target)
-      return fallback
+      return { creds: fallback, borrowed: true }
     }
 
     log("refresh_exhausted", {
@@ -797,12 +818,17 @@ async function performRefresh(
     const primaryRefreshed = refreshAccount(PRIMARY_SERVICE)
     if (primaryRefreshed && primaryRefreshed.expiresAt > Date.now() + 60_000) {
       refreshed = primaryRefreshed
+      // A primary read does not establish ownership by this suffixed source.
+      borrowedCredentialAccounts.add(target)
     }
   }
 
   if (refreshed && refreshed.expiresAt > Date.now() + 60_000) {
     target.credentials = refreshed
-    return refreshed
+    return {
+      creds: refreshed,
+      borrowed: borrowedCredentialAccounts.has(target),
+    }
   }
 
   log("refresh_exhausted", {
@@ -822,7 +848,7 @@ async function performRefresh(
  */
 async function refreshBorrowedAccount(
   target: ClaudeAccount,
-): Promise<ClaudeCredentials | null> {
+): Promise<CoordinatedRefreshResult> {
   log("refresh_borrowed", { source: target.source })
 
   let own: ClaudeCredentials | null = null
@@ -836,7 +862,7 @@ async function refreshBorrowedAccount(
     borrowedCredentialAccounts.delete(target)
     target.credentials = own
     log("refresh_borrowed_recovered", { source: target.source, via: "source" })
-    return own
+    return { creds: own }
   }
 
   // A refresh token outlives its access token by weeks, so this account's
@@ -855,14 +881,14 @@ async function refreshBorrowedAccount(
         own.accessToken,
       )
       log("refresh_borrowed_recovered", { source: target.source, via: "oauth" })
-      return oauthCreds
+      return { creds: oauthCreds }
     }
   }
 
   const again = tryFallbackAccount(target.source)
   if (again) {
     target.credentials = again
-    return again
+    return { creds: again, borrowed: true }
   }
 
   // Recovery failed. The account must not be left holding the lender's

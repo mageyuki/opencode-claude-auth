@@ -422,9 +422,10 @@ describe("refreshOAuthCredential", () => {
     })
     const deps = makeDeps({
       getAccountBySource: (source) => (source === "acct" ? chosen : null),
-      refreshIfNeeded: async (target, threshold) => {
+      refreshIfNeeded: async (target, threshold, ownSourceOnly) => {
         assert.equal(target, chosen)
         assert.equal(threshold, 5 * 60_000)
+        assert.equal(ownSourceOnly, true)
         return chosen.credentials
       },
     })
