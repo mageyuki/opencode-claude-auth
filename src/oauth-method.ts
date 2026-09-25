@@ -113,7 +113,13 @@ export async function buildOAuthCredential(
     )
   deps.setActiveAccountSource(account.source)
   deps.saveAccountSource(account.source)
-  const value = (await deps.getCachedCredentials()) ?? account.credentials
+  // Request caches may contain a sibling's loan. Only source-owned results
+  // may become durable connection credentials, including initial /connect.
+  const value = await deps.refreshIfNeeded(account, 60_000, true)
+  if (!value || value.expiresAt <= Date.now())
+    throw new Error(
+      "Claude OAuth import failed. Run `claude` to re-authenticate.",
+    )
   return Credential.OAuth.make({
     type: "oauth",
     methodID: METHOD_ID,

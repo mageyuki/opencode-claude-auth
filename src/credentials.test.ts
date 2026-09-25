@@ -9,7 +9,11 @@ import {
 import { Writable } from "node:stream"
 import { closeLogger, initLogger } from "./logger.ts"
 import { acquireRefreshLock } from "./refresh-lock.ts"
-import { refreshOAuthCredential, type OAuthDeps } from "./oauth-method.ts"
+import {
+  buildOAuthCredential,
+  refreshOAuthCredential,
+  type OAuthDeps,
+} from "./oauth-method.ts"
 import {
   chmodSync,
   mkdirSync,
@@ -1889,6 +1893,195 @@ function makeAccount(expiresAt: number) {
   }
 }
 
+describe("forced refresh coordination", () => {
+  for (const order of [
+    "forced/forced",
+    "normal/forced",
+    "forced/normal",
+  ] as const) {
+    it(`shares one exchange for ${order} callers`, async () => {
+      const originalFetch = globalThis.fetch
+      const now = Date.now()
+      const expiresAt = now + (order === "forced/forced" ? 600_000 : 30_000)
+      let release!: () => void
+      const gate = new Promise<void>((resolve) => {
+        release = resolve
+      })
+      const sent: string[] = []
+      globalThis.fetch = (async (_input, init) => {
+        sent.push(new URLSearchParams(String(init?.body)).get("refresh_token")!)
+        await gate
+        return new Response(
+          JSON.stringify({
+            access_token: "rotated-access",
+            refresh_token: "rotated-refresh",
+            expires_in: 3600,
+          }),
+        )
+      }) as typeof fetch
+      try {
+        const { credentialsModule, keychainModule } =
+          await loadCredentialsWithCountingKeychain(expiresAt)
+        const target = makeAccount(expiresAt)
+        credentialsModule.initAccounts([target])
+        keychainModule.__setCredentialsForSource(
+          target.source,
+          target.credentials,
+        )
+        const start = (mode: string) =>
+          mode === "forced"
+            ? credentialsModule.forceRefreshActiveAccount()
+            : credentialsModule.refreshIfNeeded({
+                ...target,
+                credentials: { ...target.credentials },
+              })
+        const pending = order.split("/").map(start)
+        release()
+        const results = await Promise.all(pending)
+        assert.deepEqual(sent, ["existing-refresh"])
+        for (const result of results) {
+          assert.equal(result?.accessToken, "rotated-access")
+          assert.equal(result?.refreshToken, "rotated-refresh")
+        }
+        assert.equal(keychainModule.__getWrites().length, 1)
+        assert.equal(
+          keychainModule.__getWrites()[0].expectedPriorAccessToken,
+          "existing-token",
+        )
+        assert.equal(
+          (await credentialsModule.getCachedCredentials())?.accessToken,
+          "rotated-access",
+        )
+      } finally {
+        release()
+        globalThis.fetch = originalFetch
+      }
+    })
+  }
+
+  it("honors cooldown without accepting the still-unexpired rejected token", async () => {
+    const originalFetch = globalThis.fetch
+    let exchanges = 0
+    globalThis.fetch = (async () => {
+      exchanges += 1
+      throw new Error("synthetic outage")
+    }) as typeof fetch
+    try {
+      const expiresAt = Date.now() + 600_000
+      const { credentialsModule, keychainModule, childProcessModule } =
+        await loadCredentialsWithCountingKeychain(expiresAt)
+      const target = makeAccount(expiresAt)
+      credentialsModule.initAccounts([target])
+      keychainModule.__setCredentialsForSource(
+        target.source,
+        target.credentials,
+      )
+      assert.equal(await credentialsModule.forceRefreshActiveAccount(), null)
+      assert.equal(await credentialsModule.forceRefreshActiveAccount(), null)
+      assert.equal(exchanges, 1)
+      assert.equal(target.credentials.accessToken, "existing-token")
+      assert.equal(childProcessModule.__getExecSyncCount(), 0)
+      assert.deepEqual(keychainModule.__getWrites(), [])
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
+  for (const lending of [false, true]) {
+    it(`refuses ${lending ? "a loan" : "the rejected token"} from a normal refresh it joins`, async () => {
+      const originalFetch = globalThis.fetch
+      let release!: () => void
+      const gate = new Promise<void>((resolve) => {
+        release = resolve
+      })
+      let exchanges = 0
+      globalThis.fetch = (async () => {
+        exchanges += 1
+        await gate
+        throw new Error("synthetic outage")
+      }) as typeof fetch
+      try {
+        const now = Date.now()
+        const { credentialsModule, keychainModule } =
+          await loadCredentialsWithCountingKeychain(now + 30_000)
+        const target = makeAccount(now + (lending ? 30_000 : 120_000))
+        credentialsModule.initAccounts([
+          target,
+          {
+            ...makeAccount(now + 600_000),
+            source: "lender",
+            credentials: {
+              accessToken: "loan",
+              refreshToken: "loan-refresh",
+              expiresAt: now + 600_000,
+            },
+          },
+        ])
+        keychainModule.__setCredentialsForSource(
+          target.source,
+          target.credentials,
+        )
+        const normal = credentialsModule.refreshIfNeeded(target, 5 * 60_000)
+        const forced = credentialsModule.forceRefreshActiveAccount()
+        release()
+        const [requestResult, forcedResult] = await Promise.all([
+          normal,
+          forced,
+        ])
+        assert.equal(
+          requestResult?.accessToken,
+          lending ? "loan" : "existing-token",
+        )
+        assert.equal(forcedResult, null)
+        assert.equal(exchanges, 1)
+        assert.deepEqual(keychainModule.__getWrites(), [])
+      } finally {
+        release()
+        globalThis.fetch = originalFetch
+      }
+    })
+  }
+
+  it("adopts the cross-process lock holder's own result instead of exchanging again", async () => {
+    const originalFetch = globalThis.fetch
+    let exchanges = 0
+    globalThis.fetch = (async () => {
+      exchanges += 1
+      return new Response(
+        JSON.stringify({ access_token: "duplicate", expires_in: 3600 }),
+      )
+    }) as typeof fetch
+    const lock = acquireRefreshLock("forced-locked-source")
+    assert.ok(lock)
+    try {
+      const now = Date.now()
+      const { credentialsModule, keychainModule } =
+        await loadCredentialsWithCountingKeychain(now + 600_000)
+      const target = {
+        ...makeAccount(now + 600_000),
+        source: "forced-locked-source",
+      }
+      credentialsModule.initAccounts([target])
+      keychainModule.__setCredentialsForSource(target.source, {
+        accessToken: "external-rotation",
+        refreshToken: "external-refresh",
+        expiresAt: now + 600_000,
+      })
+      const result = await credentialsModule.forceRefreshActiveAccount()
+      assert.equal(result?.accessToken, "external-rotation")
+      assert.equal(exchanges, 0)
+      assert.equal(
+        (await credentialsModule.getCachedCredentials())?.accessToken,
+        "external-rotation",
+      )
+      assert.deepEqual(keychainModule.__getWrites(), [])
+    } finally {
+      lock.release()
+      globalThis.fetch = originalFetch
+    }
+  })
+})
+
 describe("refreshIfNeeded CLI fallback scope", () => {
   it("refreshes via OAuth without spawning the claude CLI", async () => {
     const originalFetch = globalThis.fetch
@@ -2203,6 +2396,57 @@ describe("refreshIfNeeded CLI fallback scope", () => {
 })
 
 describe("borrowed fallback credentials", () => {
+  for (const ownValid of [true, false]) {
+    it(`imports only own credentials when ${ownValid ? "unexpired" : "expired"} selected credentials trigger lending`, async () => {
+      const now = Date.now()
+      const { credentialsModule, keychainModule } =
+        await loadCredentialsWithCountingKeychain(now - 1)
+      const target = makeAccount(ownValid ? now + 30_000 : now - 1)
+      const ownExpiry = target.credentials.expiresAt
+      const lender = {
+        ...makeAccount(now + 3_600_000),
+        source: "sibling",
+        credentials: {
+          accessToken: "lender-access",
+          refreshToken: "lender-refresh",
+          expiresAt: now + 3_600_000,
+        },
+      }
+      credentialsModule.initAccounts([target, lender])
+      keychainModule.__setCredentialsForSource(
+        target.source,
+        target.credentials,
+      )
+      const deps = {
+        refreshAccountsList: () => [target, lender],
+        getCachedCredentials: credentialsModule.getCachedCredentials,
+        refreshIfNeeded: credentialsModule.refreshIfNeeded,
+        setActiveAccountSource: () => {},
+        saveAccountSource: () => {},
+      } as OAuthDeps
+      if (ownValid) {
+        const result = await buildOAuthCredential(target.source, deps)
+        assert.equal(result.access, "existing-token")
+        assert.equal(result.refresh, "existing-refresh")
+        assert.equal(result.expires, ownExpiry)
+        assert.equal(result.metadata?.source, "keychain")
+      } else {
+        await assert.rejects(
+          buildOAuthCredential(target.source, deps),
+          /authenticate/,
+        )
+      }
+      assert.equal(target.credentials.accessToken, "lender-access")
+      // A later import must not fall back to the now-borrowed account object.
+      keychainModule.__setReadError(true)
+      await assert.rejects(
+        buildOAuthCredential(target.source, deps),
+        /authenticate/,
+      )
+      assert.deepEqual(keychainModule.__getWrites(), [])
+    })
+  }
+
   // The durable OAuth result must keep the connection's source identity even
   // when request callers borrow, or started the shared refresh on another
   // account object. Returning either the result or mutated account blindly
@@ -2762,6 +3006,9 @@ describe("borrowed credentials after exhaustion", () => {
       await credentialsModule.refreshIfNeeded(borrower)
       assert.equal(borrower.credentials.accessToken, "at-borrower-fresh")
 
+      // Forced recovery now honors the earlier transient cooldown too. This
+      // test isolates borrowed-flag recovery after that cooldown has elapsed.
+      Date.now = () => now + 61_000
       const seen: string[] = []
       const forced = await credentialsModule.forceRefreshActiveAccount(
         async (token: string) => {
@@ -2852,6 +3099,8 @@ describe("borrowed credentials after exhaustion", () => {
         "precondition: the reload adopts the account's own credentials",
       )
 
+      // Exercise ownership recovery, not the independent cooldown guard.
+      Date.now = () => now + 61_000
       const seen: string[] = []
       const forced = await credentialsModule.forceRefreshActiveAccount(
         async (token: string) => {

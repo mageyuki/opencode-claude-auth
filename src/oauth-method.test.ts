@@ -49,7 +49,7 @@ function makeDeps(overrides: Partial<OAuthDeps> = {}): OAuthDeps & {
             },
           })
         : null,
-    refreshIfNeeded: async () => null,
+    refreshIfNeeded: async (target) => target.credentials,
     loadPersistedAccountSource: () => null,
     getCachedCredentials: async () => null,
     setActiveAccountSource: (source) => {
@@ -224,39 +224,36 @@ describe("buildOAuthCredential", () => {
     )
   })
 
-  it("prefers cached credentials over the account's stored credentials", async () => {
+  it("imports source-only coordinated credentials instead of the request cache", async () => {
+    const expiresAt = Date.now() + 3_600_000
     const deps = makeDeps({
       refreshAccountsList: () => [account({ source: "a" })],
-      getCachedCredentials: async () => ({
-        accessToken: "cached-access",
-        refreshToken: "cached-refresh",
-        expiresAt: 123,
-      }),
+      getCachedCredentials: async () => {
+        assert.fail("request cache may contain borrowed credentials")
+      },
+      refreshIfNeeded: async (target, threshold, ownSourceOnly) => {
+        assert.equal(target.source, "a")
+        assert.equal(threshold, 60_000)
+        assert.equal(ownSourceOnly, true)
+        return {
+          accessToken: "coordinated-access",
+          refreshToken: "coordinated-refresh",
+          expiresAt,
+        }
+      },
     })
     const value = await buildOAuthCredential("a", deps)
-    assert.equal(value.access, "cached-access")
-    assert.equal(value.refresh, "cached-refresh")
-    assert.equal(value.expires, 123)
+    assert.equal(value.access, "coordinated-access")
+    assert.equal(value.refresh, "coordinated-refresh")
+    assert.equal(value.expires, expiresAt)
   })
 
-  it("falls back to the account's stored credentials when nothing is cached", async () => {
+  it("rejects an import when coordination has no own credential", async () => {
     const deps = makeDeps({
-      refreshAccountsList: () => [
-        account({
-          source: "a",
-          credentials: {
-            accessToken: "stored-access",
-            refreshToken: "stored-refresh",
-            expiresAt: 456,
-          },
-        }),
-      ],
-      getCachedCredentials: async () => null,
+      refreshAccountsList: () => [account({ source: "a" })],
+      refreshIfNeeded: async () => null,
     })
-    const value = await buildOAuthCredential("a", deps)
-    assert.equal(value.access, "stored-access")
-    assert.equal(value.refresh, "stored-refresh")
-    assert.equal(value.expires, 456)
+    await assert.rejects(buildOAuthCredential("a", deps), /re-authenticate/)
   })
 
   it("includes configDir in metadata only when present", async () => {
@@ -286,7 +283,7 @@ describe("buildOAuthCredential", () => {
           credentials: {
             accessToken: "x",
             refreshToken: "y",
-            expiresAt: 1,
+            expiresAt: Date.now() + 3_600_000,
             subscriptionType: "team",
           },
         }),

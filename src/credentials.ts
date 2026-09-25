@@ -536,6 +536,25 @@ export async function refreshIfNeeded(
     return resolve({ creds, borrowed: borrowedCredentialAccounts.has(target) })
   }
 
+  return resolve(
+    await coordinateRefresh(target, creds, () => performRefresh(target, creds)),
+  )
+}
+
+/** One coordinator for scheduled refresh, request refresh, and forced 401 recovery. */
+async function coordinateRefresh(
+  target: ClaudeAccount,
+  creds: ClaudeCredentials,
+  perform: () => Promise<CoordinatedRefreshResult>,
+): Promise<CoordinatedRefreshResult> {
+  // A joiner must consume the existing attempt's provenance even if its
+  // account object or refresh semantics differ from those of the initiator.
+  const inFlight = inFlightRefreshes.get(target.source)
+  if (inFlight) {
+    log("refresh_joined", { source: target.source })
+    return inFlight
+  }
+
   // If a recent refresh was rate-limited, don't re-hit the endpoint until the
   // cooldown clears — adopt a sibling instance's / the CLI's fresh token if one
   // has appeared, else defer. This is what stops N OpenCode instances from
@@ -546,22 +565,12 @@ export async function refreshIfNeeded(
     isRefreshCooldownActive(target.source)
   ) {
     const adopted = adoptFreshFromSource(target, creds.accessToken)
-    if (adopted) return adopted
+    if (adopted) return { creds: adopted }
     log("refresh_cooldown_skip", {
       source: target.source,
       until: getRefreshCooldownUntil(target.source),
     })
-    return resolve(null)
-  }
-
-  // The proactive sync timer calls this directly while the request path
-  // arrives via getCachedCredentials(). A rotation invalidates the refresh
-  // token it was issued against, so two concurrent refreshes would leave
-  // one caller holding an already-dead token. Share one attempt instead.
-  const inFlight = inFlightRefreshes.get(target.source)
-  if (inFlight) {
-    log("refresh_joined", { source: target.source })
-    return resolve(await inFlight)
+    return null
   }
 
   // Cross-process single-flight: only one OpenCode instance / the CLI should
@@ -571,24 +580,24 @@ export async function refreshIfNeeded(
   if (!lock) {
     log("refresh_lock_busy", { source: target.source })
     const adopted = await waitForAdopt(target, creds.accessToken)
-    if (adopted) return adopted
+    if (adopted) return { creds: adopted }
     // The holder produced nothing within the window (likely crashed; its lock
     // ages out by TTL). Defer rather than refresh lock-free, so we don't
     // recreate the burst the lock exists to prevent — the request-level wait
     // loop and the lock TTL drive eventual progress.
-    return resolve(null)
+    return null
   }
 
   const pending = (async () => {
     try {
-      return await performRefresh(target, creds)
+      return await perform()
     } finally {
       lock.release()
     }
   })()
   inFlightRefreshes.set(target.source, pending)
   try {
-    return resolve(await pending)
+    return await pending
   } finally {
     inFlightRefreshes.delete(target.source)
   }
@@ -993,9 +1002,7 @@ export function reloadActiveAccount(): void {
  * The refresh function is injectable for tests.
  */
 export async function forceRefreshActiveAccount(
-  refresh: (
-    refreshToken: string,
-  ) => Promise<ClaudeCredentials | null> = refreshViaOAuth,
+  refresh?: (refreshToken: string) => Promise<ClaudeCredentials | null>,
   account: ClaudeAccount | null = getActiveAccount(),
 ): Promise<ClaudeCredentials | null> {
   if (!account?.credentials.refreshToken) return null
@@ -1008,31 +1015,66 @@ export async function forceRefreshActiveAccount(
     return null
   }
 
-  const priorAccessToken = account.credentials.accessToken
-  const oauthCreds = await refresh(account.credentials.refreshToken)
-  if (oauthCreds && oauthCreds.expiresAt > Date.now() + 60_000) {
-    account.credentials = oauthCreds
-    if (
-      !writeBackCredentials(
-        account.source,
-        oauthCreds,
-        account.configDir,
-        priorAccessToken,
-      )
-    ) {
-      // Session continues from memory/cache either way, but the two causes
-      // diverge on a later source re-read. An I/O failure leaves our own
-      // rejected token in the store, so the re-read resurrects it and
-      // triggers another refresh. A CAS mismatch means the store now holds
-      // another account's token, so the re-read adopts that instead and this
-      // account stops using the credentials it just refreshed.
-      log("force_refresh_writeback_failed", { source: account.source })
+  const prior = account.credentials
+  const result = await coordinateRefresh(account, prior, async () => {
+    let outcome: RefreshOutcome
+    if (refresh) {
+      const fresh = await refresh(prior.refreshToken)
+      outcome = fresh
+        ? { kind: "ok", creds: fresh }
+        : { kind: "transient", status: 0 }
+    } else {
+      outcome = await refreshViaOAuthDetailed(prior.refreshToken)
     }
+    if (
+      outcome.kind === "ok" &&
+      outcome.creds.expiresAt > Date.now() + 60_000 &&
+      outcome.creds.accessToken !== prior.accessToken
+    ) {
+      const oauthCreds = outcome.creds
+      clearRefreshOutcome(account.source)
+      account.credentials = oauthCreds
+      if (
+        !writeBackCredentials(
+          account.source,
+          oauthCreds,
+          account.configDir,
+          prior.accessToken,
+        )
+      ) {
+        // Preserve the forced path's write-back diagnostics. A failed write
+        // still leaves memory usable; resolving I/O versus CAS failure is a
+        // separate concern from coordinating the token exchange.
+        log("force_refresh_writeback_failed", { source: account.source })
+      }
+      return { creds: oauthCreds }
+    }
+    if (outcome.kind === "transient") {
+      noteRefreshTransient(account.source, {
+        retryAfterMs: outcome.retryAfterMs,
+      })
+    } else if (outcome.kind === "terminal") {
+      noteRefreshTerminal(account.source)
+    }
+    // Forced failures must not fall through to the CLI, lending, or the
+    // still-unexpired access token that the API already rejected.
+    return null
+  })
+  if (
+    result &&
+    !result.borrowed &&
+    result.creds.accessToken !== prior.accessToken &&
+    result.creds.expiresAt > Date.now() + 60_000
+  ) {
+    // Joined normal refreshes and lock-holder adoption also refresh this
+    // caller's account/cache, but only the initiating attempt writes back.
+    account.credentials = result.creds
+    borrowedCredentialAccounts.delete(account)
     accountCacheMap.set(account.source, {
-      creds: oauthCreds,
+      creds: result.creds,
       cachedAt: Date.now(),
     })
-    return oauthCreds
+    return result.creds
   }
 
   log("force_refresh_failed", { source: account.source })
