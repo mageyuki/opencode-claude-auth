@@ -129,7 +129,7 @@ export async function prepareClaudeRequest(
   const account = resolveAccount(source)
   const credentials =
     (await getCachedCredentials(account)) ??
-    (await getCredentialsWithBackoff({}, account))
+    (await getCredentialsWithBackoff({ signal: request.signal }, account))
   const token = credentials?.accessToken ?? accessToken
   if (!token)
     throw new Error(

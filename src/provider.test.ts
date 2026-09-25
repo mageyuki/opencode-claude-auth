@@ -1,5 +1,8 @@
 import assert from "node:assert/strict"
+import { mkdtempSync, rmSync } from "node:fs"
 import { describe, it } from "node:test"
+import { join } from "node:path"
+import { tmpdir } from "node:os"
 import {
   buildRequestHeaders,
   claudeSubscriptionFetch,
@@ -9,6 +12,7 @@ import {
   resetExcludedBetas,
   setActiveAccountSource,
 } from "./index.ts"
+import { clearRefreshOutcome, noteRefreshTransient } from "./refresh-backoff.ts"
 
 const messageRequest = () =>
   new Request("https://api.anthropic.com/v1/messages", {
@@ -113,6 +117,53 @@ describe("Claude subscription transport", () => {
     assert.equal(headers.has("x-api-key"), false)
     assert.equal(new URL(request.url).searchParams.get("beta"), "true")
     assert.match(await request.text(), /x-anthropic-billing-header/)
+  })
+
+  it("stops waiting for transient credential backoff when the request is aborted", async () => {
+    const configDir = mkdtempSync(join(tmpdir(), "claude-auth-cancel-"))
+    const controller = new AbortController()
+    const request = new Request(messageRequest(), { signal: controller.signal })
+    let watchdog: ReturnType<typeof setTimeout> | undefined
+    try {
+      // This source reads only the empty fixture directory. The cooldown keeps
+      // the expired synthetic credential away from OAuth and CLI refreshes.
+      initAccounts([
+        {
+          label: "Synthetic file account",
+          source: "file",
+          configDir,
+          credentials: {
+            accessToken: "expired-synthetic-token",
+            refreshToken: "synthetic-refresh-token",
+            expiresAt: Date.now() + 30_000,
+          },
+        },
+      ])
+      noteRefreshTransient("file", { retryAfterMs: 60_000 })
+      controller.abort()
+
+      const prepared = await Promise.race([
+        prepareClaudeRequest(request, "fallback-token", "file"),
+        new Promise<never>((_, reject) => {
+          watchdog = setTimeout(
+            () =>
+              reject(
+                new Error("aborted request remained in credential backoff"),
+              ),
+            750,
+          )
+        }),
+      ])
+      assert.equal(
+        prepared.headers.get("authorization"),
+        "Bearer fallback-token",
+      )
+    } finally {
+      clearTimeout(watchdog)
+      clearRefreshOutcome("file")
+      initAccounts([])
+      rmSync(configDir, { recursive: true, force: true })
+    }
   })
 
   it("transforms the native response without sending another request", async () => {
