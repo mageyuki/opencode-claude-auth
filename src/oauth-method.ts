@@ -1,19 +1,15 @@
 import { Credential, Integration } from "@opencode/plugin"
 import type { IntegrationOAuthMethod } from "@opencode/plugin/promise/integration"
 import {
+  getAccountBySource,
   getCachedCredentials,
   loadPersistedAccountSource,
   refreshAccountsList,
-  refreshViaOAuth,
-  reloadCredentialsFromSource,
+  refreshIfNeeded,
   saveAccountSource,
   setActiveAccountSource,
 } from "./credentials.ts"
-import {
-  writeBackCredentials,
-  type ClaudeAccount,
-  type ClaudeCredentials,
-} from "./keychain.ts"
+import { type ClaudeAccount, type ClaudeCredentials } from "./keychain.ts"
 import { log } from "./logger.ts"
 
 export const INTEGRATION_ID: Integration.ID = Integration.ID.make("anthropic")
@@ -39,16 +35,13 @@ export interface OAuthDeps {
   refreshAccountsList: () => ClaudeAccount[]
   loadPersistedAccountSource: () => string | null
   getCachedCredentials: () => Promise<ClaudeCredentials | null>
+  getAccountBySource: (source: string) => ClaudeAccount | null
+  refreshIfNeeded: (
+    account: ClaudeAccount,
+    thresholdMs?: number,
+  ) => Promise<ClaudeCredentials | null>
   setActiveAccountSource: (source: string) => void
   saveAccountSource: (source: string) => void
-  reloadCredentialsFromSource: () => ClaudeCredentials | null
-  refreshViaOAuth: (refreshToken: string) => Promise<ClaudeCredentials | null>
-  writeBackCredentials: (
-    source: string,
-    creds: ClaudeCredentials,
-    configDir: string | undefined,
-    expectedPriorAccessToken: string,
-  ) => boolean
   log: (event: string, data?: Record<string, unknown>) => void
 }
 
@@ -155,6 +148,7 @@ export interface RefreshableCredential {
   readonly type: "oauth"
   readonly access: string
   readonly refresh: string
+  readonly expires: number
   readonly metadata?: Record<string, unknown>
 }
 
@@ -166,46 +160,51 @@ export async function refreshOAuthCredential(
     typeof value.metadata?.source === "string"
       ? value.metadata.source
       : undefined
-  const configDir =
-    typeof value.metadata?.configDir === "string"
-      ? value.metadata.configDir
-      : undefined
+  if (!source)
+    throw new Error(
+      "Claude OAuth refresh needs an account source. Reconnect Claude Code.",
+    )
 
-  // OpenCode persists whatever this returns and replays that same value on
-  // every future refresh, forever, until we return something different. If
-  // `claude` has since rotated credentials independently of this connection
-  // (a fresh interactive login, its own periodic refresh, ...), the stored
-  // refresh token goes permanently stale and every refresh fails with
-  // invalid_grant even though a working credential is sitting in the
-  // keychain right now. The keychain is the real source of truth, so check
-  // it before ever attempting a network refresh with a token that may
-  // already be dead.
-  if (source) deps.setActiveAccountSource(source)
-  const fresh = deps.reloadCredentialsFromSource()
-  if (fresh && fresh.refreshToken !== value.refresh) {
-    deps.log("refresh_resynced_from_keychain", { source })
-    return Credential.OAuth.make({
-      ...value,
-      methodID: METHOD_ID,
-      access: fresh.accessToken,
-      refresh: fresh.refreshToken,
-      expires: fresh.expiresAt,
-    })
+  // Never change the process-wide active account for a connection refresh.
+  // When the account has disappeared from the in-memory list, the connection
+  // still supplies its own source and credentials for a source-specific re-read.
+  const account: ClaudeAccount = deps.getAccountBySource(source) ?? {
+    label:
+      typeof value.metadata?.label === "string" ? value.metadata.label : source,
+    source,
+    ...(typeof value.metadata?.configDir === "string"
+      ? { configDir: value.metadata.configDir }
+      : {}),
+    credentials: {
+      accessToken: value.access,
+      refreshToken: value.refresh,
+      expiresAt: value.expires,
+    },
   }
-
-  const refreshed = await deps.refreshViaOAuth(value.refresh)
-  if (!refreshed)
+  const refreshed = await deps.refreshIfNeeded(account, 5 * 60_000)
+  // A transient outage or refresh cooldown must not invalidate a token that
+  // remains usable. Never claim an expired token is valid or extend its expiry.
+  const usable =
+    refreshed ??
+    (account.credentials.expiresAt > Date.now()
+      ? account.credentials
+      : value.expires > Date.now()
+        ? {
+            accessToken: value.access,
+            refreshToken: value.refresh,
+            expiresAt: value.expires,
+          }
+        : null)
+  if (!usable || usable.expiresAt <= Date.now())
     throw new Error(
       "Claude OAuth refresh failed. Run `claude` to re-authenticate.",
     )
-  if (source)
-    deps.writeBackCredentials(source, refreshed, configDir, value.access)
   return Credential.OAuth.make({
     ...value,
     methodID: METHOD_ID,
-    access: refreshed.accessToken,
-    refresh: refreshed.refreshToken,
-    expires: refreshed.expiresAt,
+    access: usable.accessToken,
+    refresh: usable.refreshToken,
+    expires: usable.expiresAt,
   })
 }
 
@@ -222,10 +221,9 @@ export const realOAuthDeps: OAuthDeps = {
   refreshAccountsList,
   loadPersistedAccountSource,
   getCachedCredentials,
+  getAccountBySource,
+  refreshIfNeeded,
   setActiveAccountSource,
   saveAccountSource,
-  reloadCredentialsFromSource,
-  refreshViaOAuth,
-  writeBackCredentials,
   log,
 }

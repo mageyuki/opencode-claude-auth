@@ -9,6 +9,7 @@ import {
 import { Writable } from "node:stream"
 import { closeLogger, initLogger } from "./logger.ts"
 import { acquireRefreshLock } from "./refresh-lock.ts"
+import { refreshOAuthCredential, type OAuthDeps } from "./oauth-method.ts"
 import {
   chmodSync,
   mkdirSync,
@@ -2003,14 +2004,35 @@ describe("refreshIfNeeded CLI fallback scope", () => {
       const target = makeAccount(now + 30_000)
       credentialsModule.initAccounts([target])
 
+      const deps = {
+        getAccountBySource: (source: string) =>
+          source === target.source ? target : null,
+        refreshIfNeeded: credentialsModule.refreshIfNeeded,
+        setActiveAccountSource: () => {
+          throw new Error("refresh changed process-wide account selection")
+        },
+        reloadCredentialsFromSource: () => null,
+        refreshViaOAuth: async () => {
+          throw new Error("refresh bypassed account coordinator")
+        },
+      } as OAuthDeps
+      const stored = {
+        type: "oauth" as const,
+        access: "token",
+        refresh: "refresh",
+        expires: now + 30_000,
+        metadata: { source: target.source },
+      }
       const [viaTimer, viaRequest] = await Promise.all([
-        credentialsModule.refreshIfNeeded(undefined, 60 * 60_000),
-        credentialsModule.getCachedCredentials(),
+        refreshOAuthCredential(stored, deps),
+        refreshOAuthCredential(stored, deps),
       ])
 
       assert.equal(fetchCount, 1, "expected exactly one OAuth refresh")
-      assert.equal(viaTimer?.accessToken, "sk-ant-oat01-1")
-      assert.equal(viaRequest?.accessToken, "sk-ant-oat01-1")
+      assert.equal(viaTimer.access, "sk-ant-oat01-1")
+      assert.equal(viaRequest.access, "sk-ant-oat01-1")
+      assert.equal(viaTimer.refresh, "sk-ant-ort01-1")
+      assert.equal(viaRequest.refresh, "sk-ant-ort01-1")
     } finally {
       globalThis.fetch = originalFetch
       Date.now = originalNow
