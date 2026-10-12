@@ -1,12 +1,26 @@
-# opencode-claude-auth
+# @mageyuki/opencode-claude-auth
 
-[![npm](https://img.shields.io/npm/v/opencode-claude-auth)](https://www.npmjs.com/package/opencode-claude-auth)
-[![CI](https://github.com/griffinmartin/opencode-claude-auth/actions/workflows/ci.yml/badge.svg)](https://github.com/griffinmartin/opencode-claude-auth/actions/workflows/ci.yml)
-[![Socket Badge](https://socket.dev/api/badge/npm/package/opencode-claude-auth)](https://socket.dev/npm/package/opencode-claude-auth)
+[![CI](https://github.com/mageyuki/opencode-claude-auth/actions/workflows/ci.yml/badge.svg)](https://github.com/mageyuki/opencode-claude-auth/actions/workflows/ci.yml)
 
 Self-contained Anthropic auth provider for OpenCode 2 using your Claude Code subscription credentials — no separate login or API key needed.
 
-> **Requires OpenCode 2.** This version targets OpenCode 2's plugin and auth APIs and will not load on OpenCode 1. If you're still on OpenCode 1, pin `opencode-claude-auth` to a version prior to this change instead of tracking `@latest`.
+> **Unofficial fork.** This package is an independent fork of [`opencode-claude-auth`](https://github.com/griffinmartin/opencode-claude-auth) by [griffinmartin](https://github.com/griffinmartin). It is **not** the upstream project, is not endorsed by or affiliated with its author, and is maintained separately at [mageyuki/opencode-claude-auth](https://github.com/mageyuki/opencode-claude-auth). Report problems with this fork at its [issue tracker](https://github.com/mageyuki/opencode-claude-auth/issues), not upstream.
+>
+> **Status: prepared for npm, not yet published.** The scoped name `@mageyuki/opencode-claude-auth` is the intended public npm name. Until a release is actually published, `npm install` / `opencode plugin add` of that name will fail; remove this note when it is. See [Divergence from upstream](#divergence-from-upstream).
+
+> **Requires OpenCode 2.** This version targets OpenCode 2's plugin and auth APIs and will not load on OpenCode 1. If you're still on OpenCode 1, use the upstream `opencode-claude-auth` package at a release prior to its OpenCode 2 adoption instead.
+
+## Divergence from upstream
+
+The package version `2.2.1` is the upstream version this fork was based on. The scoped name is a separate npm package, so the version numbers do not track each other from here on, and the contents differ: upstream's published [`opencode-claude-auth@2.2.1`](https://www.npmjs.com/package/opencode-claude-auth) targets OpenCode 1 (`@opencode-ai/plugin`), while this fork is OpenCode 2 only (`@opencode/plugin`). Beyond upstream 2.2.1 this fork carries:
+
+- The OpenCode 2 support snapshot from the (at the time of writing, still open) upstream pull request [#274](https://github.com/griffinmartin/opencode-claude-auth/pull/274), plus fork fixes on top of it: coordinated per-account OAuth token refresh, initial account import binding, and credential-backoff cancellation together with the model request.
+- Claude Code version update to 2.1.284 for Sonnet 5.5.
+- Package metadata for the scoped name (`@mageyuki/opencode-claude-auth`, repository/bugs/homepage pointing at the fork, public access).
+
+For compatibility with credentials and settings already stored by upstream, the plugin id (`griffinmartin.claude-auth`) and the credential metadata key (`opencode-claude-auth/claude-code-oauth`) are intentionally unchanged. Because of this, do **not** enable this package and upstream `opencode-claude-auth` at the same time.
+
+Licensed under the MIT license of the original project; the original copyright notice is preserved in [LICENSE](LICENSE).
 
 ## How it works
 
@@ -34,12 +48,12 @@ If you run [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI), you don'
    }
    ```
 
-Remove `opencode-claude-auth` from your `plugin` list when using this setup — the two approaches shouldn't be combined. CLIProxyAPI also supports multi-account load balancing and other providers (Codex, Gemini, Grok). This plugin remains the lighter option if you only need Claude Code credentials in OpenCode with no extra service running.
+Remove `@mageyuki/opencode-claude-auth` from your `plugins` list when using this setup — the two approaches shouldn't be combined. CLIProxyAPI also supports multi-account load balancing and other providers (Codex, Gemini, Grok). This plugin remains the lighter option if you only need Claude Code credentials in OpenCode with no extra service running.
 
 ## Prerequisites
 
 - OpenCode 2 installed — see the [OpenCode 2 migration guide](https://opencode.ai/v2/docs/migrate-v1) for installation instructions
-- Claude Code installed and authenticated (run `claude` at least once)
+- Claude Code installed. Claude Code authentication is an operator-owned prerequisite; never read, print, copy or request credential/token files to check it; credential setup/refresh is not part of this preparation.
 
 macOS is preferred (uses Keychain). Linux and Windows work via the credentials file fallback.
 
@@ -52,7 +66,7 @@ macOS is preferred (uses Keychain). Linux and Windows work via the credentials f
 Paste this into any LLM agent (Claude Code, OpenCode, Cursor, etc.):
 
 ```
-Install the opencode-claude-auth plugin and configure it by following: https://raw.githubusercontent.com/griffinmartin/opencode-claude-auth/main/installation.md
+Install the @mageyuki/opencode-claude-auth plugin and configure it by following: https://raw.githubusercontent.com/mageyuki/opencode-claude-auth/main/installation.md
 ```
 
 **Option B: Manual setup**
@@ -61,11 +75,11 @@ Install the opencode-claude-auth plugin and configure it by following: https://r
 
    ```json
    {
-     "plugins": ["opencode-claude-auth@latest"]
+     "plugins": ["@mageyuki/opencode-claude-auth@2.2.1"]
    }
    ```
 
-   > OpenCode 2 uses the `plugins` key (plural) — OpenCode 1 used `plugin` (singular). The `@latest` tag ensures OpenCode always pulls the newest version on startup. No manual `npm install` is needed — OpenCode [automatically installs npm plugins using Bun at startup](https://opencode.ai/docs/plugins/#how-plugins-are-installed).
+   > OpenCode 2 uses the `plugins` key (plural) — OpenCode 1 used `plugin` (singular). The version is pinned to the release `2.2.1` for reproducible installs; keep any existing plugin entries in the array unchanged. You can also run `opencode plugin add @mageyuki/opencode-claude-auth@2.2.1`. See the [OpenCode 2 plugins guide](https://opencode.ai/v2/docs/plugins). This only works once the package has been published (see the status note at the top).
 
 2. **Connect it** — restart OpenCode, run `/connect`, choose **Anthropic**, then **Import Claude Code subscription**. Use `/models` and pick a model under **Anthropic**.
 
@@ -126,7 +140,7 @@ If only one account is found, the selection prompt is skipped and the plugin use
 | "Credentials are unavailable or expired"                       | Run `claude` to refresh your Claude Code credentials                                                                                                                                                          |
 | Auth keeps failing right after re-authenticating with `claude` | OpenCode may still be holding a refresh token from a previous `/connect` that's now stale. The plugin re-syncs from the keychain automatically on the next refresh; if it's still stuck, run `/connect` again |
 | "Extra usage is required for long context requests"            | Your conversation exceeded 200k tokens. See [Long context (1M)](#long-context-1m) below                                                                                                                       |
-| Plugin not updating to latest version                          | Delete the cached package: `rm -rf ~/.cache/opencode/packages/opencode-claude-auth@latest/` then restart OpenCode                                                                                             |
+| Plugin not updating to latest version                          | The exact `2.2.1` pin stays in place; `opencode plugin update` skips exact revisions and is not a fix. Moving to another version is a separately approved config edit after that version is published         |
 
 ### Diagnostic logging
 
