@@ -1,5 +1,16 @@
 # Changelog
 
+## 3.0.2 (2026-11-14)
+
+Fork release of `@mageyuki/opencode-claude-auth` (unofficial), based on upstream `opencode-claude-auth` [3.0.0](https://github.com/griffinmartin/opencode-claude-auth/tree/v3.0.0).
+
+### Bug Fixes
+
+* never save another account's lent tokens as a connection's credential (OpenCode refresh callback and `/connect` import)
+* stop waiting for credential backoff when the model request is cancelled
+
+Not included yet: coordinating the forced token refresh after a 401 response with other refreshes of the same account; this release adds no such coordination. One related change: a suffixed account (`Claude Code-credentials-<suffix>`) running on the primary account's credentials is now treated as borrowed, so the existing borrowed-account guard makes that forced refresh return null instead of exchanging the primary account's refresh token.
+
 ## 3.0.1 (2026-11-14)
 
 Fork release of `@mageyuki/opencode-claude-auth` (unofficial), based on upstream `opencode-claude-auth` [3.0.0](https://github.com/griffinmartin/opencode-claude-auth/tree/v3.0.0).

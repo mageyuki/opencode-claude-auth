@@ -258,6 +258,50 @@ describe("buildOAuthCredential", () => {
     assert.equal(value.expires, 456)
   })
 
+  // The request cache can hold another account's lent tokens; the import
+  // saves what it gets as the selected account's credential.
+  it("uses getOwnSourceCredentials when provided, never the request cache", async () => {
+    const deps = makeDeps({
+      refreshAccountsList: () => [
+        account({ source: "a" }),
+        account({ source: "b" }),
+      ],
+      getCachedCredentials: async () => ({
+        accessToken: "cached-loan",
+        refreshToken: "cached-loan-refresh",
+        expiresAt: 123,
+      }),
+      getOwnSourceCredentials: async (selected) =>
+        selected.source === "b"
+          ? {
+              accessToken: "own-access",
+              refreshToken: "own-refresh",
+              expiresAt: 789,
+            }
+          : null,
+    })
+    const value = await buildOAuthCredential("b", deps)
+    assert.equal(value.access, "own-access")
+    assert.equal(value.refresh, "own-refresh")
+    assert.equal(value.expires, 789)
+  })
+
+  it("throws when getOwnSourceCredentials yields null", async () => {
+    const deps = makeDeps({
+      refreshAccountsList: () => [account({ source: "a" })],
+      getCachedCredentials: async () => ({
+        accessToken: "cached-loan",
+        refreshToken: "cached-loan-refresh",
+        expiresAt: 123,
+      }),
+      getOwnSourceCredentials: async () => null,
+    })
+    await assert.rejects(
+      () => buildOAuthCredential("a", deps),
+      /Run `claude` to authenticate first/,
+    )
+  })
+
   it("includes configDir in metadata only when present", async () => {
     const withConfigDir = makeDeps({
       refreshAccountsList: () => [
