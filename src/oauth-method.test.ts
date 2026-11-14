@@ -32,24 +32,12 @@ function makeDeps(overrides: Partial<OAuthDeps> = {}): OAuthDeps & {
   const calls: Record<string, unknown[]> = {
     setActiveAccountSource: [],
     saveAccountSource: [],
+    writeBackCredentials: [],
     log: [],
   }
   return {
     calls,
     refreshAccountsList: () => [account()],
-    getAccountBySource: (source) =>
-      source === "acct"
-        ? account({
-            source,
-            configDir: "/tmp/claude",
-            credentials: {
-              accessToken: "old-access",
-              refreshToken: "old-refresh",
-              expiresAt: 1,
-            },
-          })
-        : null,
-    refreshIfNeeded: async (target) => target.credentials,
     loadPersistedAccountSource: () => null,
     getCachedCredentials: async () => null,
     setActiveAccountSource: (source) => {
@@ -57,6 +45,17 @@ function makeDeps(overrides: Partial<OAuthDeps> = {}): OAuthDeps & {
     },
     saveAccountSource: (source) => {
       calls.saveAccountSource.push(source)
+    },
+    reloadCredentialsFromSource: () => null,
+    readStoredCredentials: () => null,
+    // No tracked account by default, so refresh tests exercise the direct
+    // exchange used for credentials the plugin no longer knows about.
+    getAccountBySource: () => null,
+    rotateAccountCredentials: async () => null,
+    refreshViaOAuth: async () => null,
+    writeBackCredentials: (source, creds, configDir, expected) => {
+      calls.writeBackCredentials.push([source, creds, configDir, expected])
+      return true
     },
     log: (event, data) => {
       calls.log.push([event, data])
@@ -224,36 +223,39 @@ describe("buildOAuthCredential", () => {
     )
   })
 
-  it("imports source-only coordinated credentials instead of the request cache", async () => {
-    const expiresAt = Date.now() + 3_600_000
+  it("prefers cached credentials over the account's stored credentials", async () => {
     const deps = makeDeps({
       refreshAccountsList: () => [account({ source: "a" })],
-      getCachedCredentials: async () => {
-        assert.fail("request cache may contain borrowed credentials")
-      },
-      refreshIfNeeded: async (target, threshold, ownSourceOnly) => {
-        assert.equal(target.source, "a")
-        assert.equal(threshold, 60_000)
-        assert.equal(ownSourceOnly, true)
-        return {
-          accessToken: "coordinated-access",
-          refreshToken: "coordinated-refresh",
-          expiresAt,
-        }
-      },
+      getCachedCredentials: async () => ({
+        accessToken: "cached-access",
+        refreshToken: "cached-refresh",
+        expiresAt: 123,
+      }),
     })
     const value = await buildOAuthCredential("a", deps)
-    assert.equal(value.access, "coordinated-access")
-    assert.equal(value.refresh, "coordinated-refresh")
-    assert.equal(value.expires, expiresAt)
+    assert.equal(value.access, "cached-access")
+    assert.equal(value.refresh, "cached-refresh")
+    assert.equal(value.expires, 123)
   })
 
-  it("rejects an import when coordination has no own credential", async () => {
+  it("falls back to the account's stored credentials when nothing is cached", async () => {
     const deps = makeDeps({
-      refreshAccountsList: () => [account({ source: "a" })],
-      refreshIfNeeded: async () => null,
+      refreshAccountsList: () => [
+        account({
+          source: "a",
+          credentials: {
+            accessToken: "stored-access",
+            refreshToken: "stored-refresh",
+            expiresAt: 456,
+          },
+        }),
+      ],
+      getCachedCredentials: async () => null,
     })
-    await assert.rejects(buildOAuthCredential("a", deps), /re-authenticate/)
+    const value = await buildOAuthCredential("a", deps)
+    assert.equal(value.access, "stored-access")
+    assert.equal(value.refresh, "stored-refresh")
+    assert.equal(value.expires, 456)
   })
 
   it("includes configDir in metadata only when present", async () => {
@@ -283,7 +285,7 @@ describe("buildOAuthCredential", () => {
           credentials: {
             accessToken: "x",
             refreshToken: "y",
-            expiresAt: Date.now() + 3_600_000,
+            expiresAt: 1,
             subscriptionType: "team",
           },
         }),
@@ -340,48 +342,96 @@ describe("refreshOAuthCredential", () => {
     type: "oauth" as const,
     access: "old-access",
     refresh: "old-refresh",
-    expires: Date.now() + 120_000,
     metadata: { source: "acct", configDir: "/tmp/claude" },
   }
 
-  it("keeps a still-valid account token and its real expiry after a transient refresh failure", async () => {
-    const deps = makeDeps({
-      getAccountBySource: () => null,
-      refreshIfNeeded: async () => null,
-    })
-    const result = await refreshOAuthCredential(value, deps)
-    assert.equal(result.access, "old-access")
-    assert.equal(result.refresh, "old-refresh")
-    assert.equal(result.expires, value.expires)
-    assert.equal(result.metadata?.source, "acct")
-    assert.equal(result.methodID, "claude-code")
-  })
-
   it("resyncs from the keychain instead of hitting the network when it disagrees", async () => {
-    let coordinated = false
+    let refreshViaOAuthCalled = false
     const deps = makeDeps({
-      refreshIfNeeded: async () => {
-        coordinated = true
-        return {
-          accessToken: "fresh-access",
-          refreshToken: "fresh-refresh",
-          expiresAt: value.expires + 3_600_000,
-        }
+      reloadCredentialsFromSource: () => ({
+        accessToken: "fresh-access",
+        refreshToken: "fresh-refresh",
+        expiresAt: 999,
+      }),
+      refreshViaOAuth: async () => {
+        refreshViaOAuthCalled = true
+        return null
       },
     })
     const result = await refreshOAuthCredential(value, deps)
     assert.equal(result.access, "fresh-access")
     assert.equal(result.refresh, "fresh-refresh")
-    assert.equal(result.expires, value.expires + 3_600_000)
-    assert.equal(coordinated, true)
+    assert.equal(result.expires, 999)
+    assert.equal(refreshViaOAuthCalled, false)
+    assert.deepEqual(deps.calls.log[0], [
+      "refresh_resynced_from_keychain",
+      { source: "acct" },
+    ])
+  })
+
+  it("uses the stored refresh token even when the stored access token has expired", async () => {
+    let tokenUsed: string | undefined
+    const deps = makeDeps({
+      reloadCredentialsFromSource: () => null,
+      readStoredCredentials: (source, configDir) => {
+        assert.equal(source, "acct")
+        assert.equal(configDir, "/tmp/claude")
+        return {
+          accessToken: "expired-stored-access",
+          refreshToken: "rotated-stored-refresh",
+          expiresAt: 0,
+        }
+      },
+      refreshViaOAuth: async (token) => {
+        tokenUsed = token
+        return {
+          accessToken: "refreshed-access",
+          refreshToken: "refreshed-refresh",
+          expiresAt: 333,
+        }
+      },
+    })
+
+    const result = await refreshOAuthCredential(value, deps)
+
+    assert.equal(tokenUsed, "rotated-stored-refresh")
+    assert.equal(result.refresh, "refreshed-refresh")
+    assert.equal(
+      deps.calls.writeBackCredentials[0]?.[3],
+      "expired-stored-access",
+    )
+  })
+
+  it("falls back to OpenCode's refresh token when the store read throws", async () => {
+    let tokenUsed: string | undefined
+    const deps = makeDeps({
+      reloadCredentialsFromSource: () => null,
+      readStoredCredentials: () => {
+        throw new Error("keychain locked")
+      },
+      refreshViaOAuth: async (token) => {
+        tokenUsed = token
+        return {
+          accessToken: "refreshed-access",
+          refreshToken: "refreshed-refresh",
+          expiresAt: 333,
+        }
+      },
+    })
+
+    await refreshOAuthCredential(value, deps)
+
+    assert.equal(tokenUsed, "old-refresh")
+    assert.equal(deps.calls.writeBackCredentials[0]?.[3], "old-access")
   })
 
   it("preserves the Claude Code OAuth marker across refresh", async () => {
     const deps = makeDeps({
-      refreshIfNeeded: async () => ({
+      reloadCredentialsFromSource: () => null,
+      refreshViaOAuth: async () => ({
         accessToken: "refreshed-access",
         refreshToken: "refreshed-refresh",
-        expiresAt: Date.now() + 3_600_000,
+        expiresAt: 111,
       }),
     })
     const result = await refreshOAuthCredential(
@@ -400,54 +450,172 @@ describe("refreshOAuthCredential", () => {
     )
   })
 
-  it("rejects an expired account token if coordinated refresh fails", async () => {
-    const deps = makeDeps({ getAccountBySource: () => null })
+  it("falls through to a network refresh when the keychain is unavailable", async () => {
+    const deps = makeDeps({
+      reloadCredentialsFromSource: () => null,
+      refreshViaOAuth: async () => ({
+        accessToken: "refreshed-access",
+        refreshToken: "refreshed-refresh",
+        expiresAt: 111,
+      }),
+    })
+    const result = await refreshOAuthCredential(value, deps)
+    assert.equal(result.access, "refreshed-access")
+  })
+
+  it("falls through to a network refresh when the keychain agrees with what we have", async () => {
+    const deps = makeDeps({
+      reloadCredentialsFromSource: () => ({
+        accessToken: "old-access",
+        refreshToken: "old-refresh",
+        expiresAt: 1,
+      }),
+      refreshViaOAuth: async () => ({
+        accessToken: "refreshed-access",
+        refreshToken: "refreshed-refresh",
+        expiresAt: 222,
+      }),
+    })
+    const result = await refreshOAuthCredential(value, deps)
+    assert.equal(result.access, "refreshed-access")
+  })
+
+  it("throws a clear error when the network refresh fails", async () => {
+    const deps = makeDeps({
+      reloadCredentialsFromSource: () => null,
+      refreshViaOAuth: async () => null,
+    })
     await assert.rejects(
-      () => refreshOAuthCredential({ ...value, expires: Date.now() - 1 }, deps),
+      () => refreshOAuthCredential(value, deps),
       /Run `claude` to re-authenticate/,
     )
   })
 
-  it("resolves only the connection's account without changing active selection", async () => {
-    const chosen = account({
-      source: "acct",
-      credentials: {
-        accessToken: "own-access",
-        refreshToken: "own-refresh",
-        expiresAt: Date.now() + 60_000,
-      },
-    })
+  it("writes back credentials after a successful network refresh", async () => {
     const deps = makeDeps({
-      getAccountBySource: (source) => (source === "acct" ? chosen : null),
-      refreshIfNeeded: async (target, threshold, ownSourceOnly) => {
-        assert.equal(target, chosen)
-        assert.equal(threshold, 5 * 60_000)
-        assert.equal(ownSourceOnly, true)
-        return chosen.credentials
-      },
+      reloadCredentialsFromSource: () => null,
+      refreshViaOAuth: async () => ({
+        accessToken: "refreshed-access",
+        refreshToken: "refreshed-refresh",
+        expiresAt: 333,
+      }),
     })
-    const result = await refreshOAuthCredential(value, deps)
-    assert.equal(result.access, "own-access")
-    assert.equal(result.metadata?.source, "acct")
-    assert.deepEqual(deps.calls.setActiveAccountSource, [])
+    await refreshOAuthCredential(value, deps)
+    assert.equal(deps.calls.writeBackCredentials.length, 1)
+    assert.deepEqual(deps.calls.writeBackCredentials[0], [
+      "acct",
+      {
+        accessToken: "refreshed-access",
+        refreshToken: "refreshed-refresh",
+        expiresAt: 333,
+      },
+      "/tmp/claude",
+      "old-access",
+    ])
   })
 
-  it("rejects missing source rather than refreshing a different account", async () => {
-    const deps = makeDeps()
-    await assert.rejects(
-      () =>
-        refreshOAuthCredential(
-          {
-            type: "oauth",
-            access: "a",
-            refresh: "r",
-            expires: Date.now() + 1000,
-          },
-          deps,
-        ),
-      /account source/,
+  it("does not write back credentials when there is no source in metadata", async () => {
+    const deps = makeDeps({
+      reloadCredentialsFromSource: () => null,
+      refreshViaOAuth: async () => ({
+        accessToken: "refreshed-access",
+        refreshToken: "refreshed-refresh",
+        expiresAt: 333,
+      }),
+    })
+    await refreshOAuthCredential(
+      { type: "oauth" as const, access: "a", refresh: "r" },
+      deps,
     )
-    assert.deepEqual(deps.calls.setActiveAccountSource, [])
+    assert.equal(deps.calls.writeBackCredentials.length, 0)
+  })
+
+  it("marks the account active before checking the keychain, only when a source is present", async () => {
+    const successfulRefresh = {
+      reloadCredentialsFromSource: () => null,
+      refreshViaOAuth: async () => ({
+        accessToken: "refreshed-access",
+        refreshToken: "refreshed-refresh",
+        expiresAt: 999,
+      }),
+    }
+    const deps = makeDeps(successfulRefresh)
+    await refreshOAuthCredential(value, deps)
+    assert.deepEqual(deps.calls.setActiveAccountSource, ["acct"])
+
+    const depsNoSource = makeDeps(successfulRefresh)
+    await refreshOAuthCredential(
+      { type: "oauth" as const, access: "a", refresh: "r" },
+      depsNoSource,
+    )
+    assert.deepEqual(depsNoSource.calls.setActiveAccountSource, [])
+  })
+
+  describe("for an account the plugin tracks", () => {
+    const tracked = account({ source: "acct" })
+    const rotated = {
+      accessToken: "rotated-access",
+      refreshToken: "rotated-refresh",
+      expiresAt: 444,
+    }
+
+    it("rotates through the shared refresh instead of exchanging the token itself", async () => {
+      let rotatedAccount: ClaudeAccount | undefined
+      let directExchange = false
+      const deps = makeDeps({
+        getAccountBySource: (source) => (source === "acct" ? tracked : null),
+        rotateAccountCredentials: async (target) => {
+          rotatedAccount = target
+          return rotated
+        },
+        refreshViaOAuth: async () => {
+          directExchange = true
+          return null
+        },
+      })
+
+      const result = await refreshOAuthCredential(value, deps)
+
+      assert.equal(rotatedAccount, tracked)
+      assert.equal(directExchange, false)
+      assert.equal(result.access, "rotated-access")
+      assert.equal(result.refresh, "rotated-refresh")
+      assert.equal(result.expires, 444)
+      // The shared refresh already persisted the rotation to the store.
+      assert.equal(deps.calls.writeBackCredentials.length, 0)
+    })
+
+    it("still resyncs from the keychain before rotating", async () => {
+      let rotations = 0
+      const deps = makeDeps({
+        getAccountBySource: () => tracked,
+        reloadCredentialsFromSource: () => ({
+          accessToken: "fresh-access",
+          refreshToken: "fresh-refresh",
+          expiresAt: 999,
+        }),
+        rotateAccountCredentials: async () => {
+          rotations += 1
+          return rotated
+        },
+      })
+
+      const result = await refreshOAuthCredential(value, deps)
+
+      assert.equal(result.access, "fresh-access")
+      assert.equal(rotations, 0)
+    })
+
+    it("throws a clear error when the shared refresh produces nothing", async () => {
+      const deps = makeDeps({
+        getAccountBySource: () => tracked,
+        rotateAccountCredentials: async () => null,
+      })
+      await assert.rejects(
+        () => refreshOAuthCredential(value, deps),
+        /Run `claude` to re-authenticate/,
+      )
+    })
   })
 })
 

@@ -20,23 +20,12 @@ import {
 } from "./credentials.ts"
 import { fetchWithRetry } from "./http.ts"
 import { log } from "./logger.ts"
-import { config } from "./model-config.ts"
+import { getUserAgent } from "./model-config.ts"
 import { transformBody, transformResponseStream } from "./transforms.ts"
 
 const sessionID = crypto.randomUUID()
 
 type Fetch = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>
-
-function getCliVersion() {
-  return process.env.ANTHROPIC_CLI_VERSION ?? config.ccVersion
-}
-
-function getUserAgent() {
-  return (
-    process.env.ANTHROPIC_USER_AGENT ??
-    `claude-cli/${getCliVersion()} (external, sdk-cli)`
-  )
-}
 
 function buildRequestURL(input: RequestInfo | URL) {
   const raw =
@@ -129,7 +118,7 @@ export async function prepareClaudeRequest(
   const account = resolveAccount(source)
   const credentials =
     (await getCachedCredentials(account)) ??
-    (await getCredentialsWithBackoff({ signal: request.signal }, account))
+    (await getCredentialsWithBackoff({}, account))
   const token = credentials?.accessToken ?? accessToken
   if (!token)
     throw new Error(

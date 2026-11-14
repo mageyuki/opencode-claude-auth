@@ -5,18 +5,24 @@
 Self-contained Anthropic auth provider for OpenCode 2 using your Claude Code subscription credentials — no separate login or API key needed.
 
 > **Unofficial fork.** This package is an independent fork of [`opencode-claude-auth`](https://github.com/griffinmartin/opencode-claude-auth) by [griffinmartin](https://github.com/griffinmartin). It is **not** the upstream project, is not endorsed by or affiliated with its author, and is maintained separately at [mageyuki/opencode-claude-auth](https://github.com/mageyuki/opencode-claude-auth). Report problems with this fork at its [issue tracker](https://github.com/mageyuki/opencode-claude-auth/issues), not upstream.
->
-> **Status: prepared for npm, not yet published.** The scoped name `@mageyuki/opencode-claude-auth` is the intended public npm name. Until a release is actually published, `npm install` / `opencode plugin add` of that name will fail; remove this note when it is. See [Divergence from upstream](#divergence-from-upstream).
 
-> **Requires OpenCode 2.** This version targets OpenCode 2's plugin and auth APIs and will not load on OpenCode 1. If you're still on OpenCode 1, use the upstream `opencode-claude-auth` package at a release prior to its OpenCode 2 adoption instead.
+> **Requires OpenCode 2.0+ and will not load on OpenCode 1.x.** For OpenCode 1.x, use the upstream package `opencode-claude-auth@2.2.1` instead — see [Migrating from OpenCode 1](#migrating-from-opencode-1).
+
+## Compatibility
+
+| Package                                | OpenCode  | Config key | Install                                |
+| -------------------------------------- | --------- | ---------- | -------------------------------------- |
+| `@mageyuki/opencode-claude-auth` 3.0.1 | 2.0+ only | `plugins`  | `@mageyuki/opencode-claude-auth@3.0.1` |
+| upstream `opencode-claude-auth` 2.2.1  | 1.x       | `plugin`   | `opencode-claude-auth@2.2.1`           |
 
 ## Divergence from upstream
 
-The package version `2.2.1` is the upstream version this fork was based on. The scoped name is a separate npm package, so the version numbers do not track each other from here on, and the contents differ: upstream's published [`opencode-claude-auth@2.2.1`](https://www.npmjs.com/package/opencode-claude-auth) targets OpenCode 1 (`@opencode-ai/plugin`), while this fork is OpenCode 2 only (`@opencode/plugin`). Beyond upstream 2.2.1 this fork carries:
+Version 3.0.1 of this fork is upstream `opencode-claude-auth` [3.0.0](https://github.com/griffinmartin/opencode-claude-auth/tree/v3.0.0) plus:
 
-- The OpenCode 2 support snapshot from the (at the time of writing, still open) upstream pull request [#274](https://github.com/griffinmartin/opencode-claude-auth/pull/274), plus fork fixes on top of it: coordinated per-account OAuth token refresh, initial account import binding, and credential-backoff cancellation together with the model request.
-- Claude Code version update to 2.1.284 for Sonnet 5.5.
+- Claude Code version update to 2.1.325, required by Fable 5.2 (upstream issue [#298](https://github.com/griffinmartin/opencode-claude-auth/issues/298)).
 - Package metadata for the scoped name (`@mageyuki/opencode-claude-auth`, repository/bugs/homepage pointing at the fork, public access).
+
+The scoped name is a separate npm package, so its version numbers do not track upstream's.
 
 For compatibility with credentials and settings already stored by upstream, the plugin id (`griffinmartin.claude-auth`) and the credential metadata key (`opencode-claude-auth/claude-code-oauth`) are intentionally unchanged. Because of this, do **not** enable this package and upstream `opencode-claude-auth` at the same time.
 
@@ -53,7 +59,7 @@ Remove `@mageyuki/opencode-claude-auth` from your `plugins` list when using this
 ## Prerequisites
 
 - OpenCode 2 installed — see the [OpenCode 2 migration guide](https://opencode.ai/v2/docs/migrate-v1) for installation instructions
-- Claude Code installed. Claude Code authentication is an operator-owned prerequisite; never read, print, copy or request credential/token files to check it; credential setup/refresh is not part of this preparation.
+- Claude Code installed and authenticated (run `claude` at least once)
 
 macOS is preferred (uses Keychain). Linux and Windows work via the credentials file fallback.
 
@@ -75,11 +81,11 @@ Install the @mageyuki/opencode-claude-auth plugin and configure it by following:
 
    ```json
    {
-     "plugins": ["@mageyuki/opencode-claude-auth@2.2.1"]
+     "plugins": ["@mageyuki/opencode-claude-auth@3.0.1"]
    }
    ```
 
-   > OpenCode 2 uses the `plugins` key (plural) — OpenCode 1 used `plugin` (singular). The version is pinned to the release `2.2.1` for reproducible installs; keep any existing plugin entries in the array unchanged. You can also run `opencode plugin add @mageyuki/opencode-claude-auth@2.2.1`. See the [OpenCode 2 plugins guide](https://opencode.ai/v2/docs/plugins). This only works once the package has been published (see the status note at the top).
+   > OpenCode 2 uses the `plugins` key (plural) — OpenCode 1 used `plugin` (singular). The version is pinned to the release `3.0.1` for reproducible installs; keep any existing plugin entries in the array unchanged. You can also run `opencode plugin add @mageyuki/opencode-claude-auth@3.0.1`. No manual `npm install` is needed — OpenCode installs package plugins itself (see the [OpenCode 2 plugins guide](https://opencode.ai/v2/docs/plugins)).
 
 2. **Connect it** — restart OpenCode, run `/connect`, choose **Anthropic**, then **Import Claude Code subscription**. Use `/models` and pick a model under **Anthropic**.
 
@@ -90,6 +96,31 @@ See [installation.md](installation.md) for step-by-step agent instructions.
 ## Usage
 
 Run `/connect` once to import your Claude Code subscription, then use OpenCode normally — the plugin refreshes credentials automatically and provides them to the Anthropic API. If your credentials aren't OAuth-based, the connection falls through to standard API key auth.
+
+## Migrating from OpenCode 1
+
+OpenCode 2 replaced the plugin and auth APIs this plugin used under OpenCode 1, so this fork only loads on OpenCode 2.
+
+1. Upgrade OpenCode — see the [OpenCode 2 migration guide](https://opencode.ai/v2/docs/migrate-v1).
+2. In `~/.config/opencode/opencode.json`, remove the plugin from the `plugin` key (OpenCode 1) and add this fork to `plugins` (OpenCode 2):
+
+   ```json
+   {
+     "plugins": ["@mageyuki/opencode-claude-auth@3.0.1"]
+   }
+   ```
+
+3. Restart OpenCode, run `/connect`, choose **Anthropic**, then **Import Claude Code subscription**. The OpenCode 1 connection isn't carried over.
+
+### Staying on OpenCode 1
+
+This fork does not support OpenCode 1. Upstream **2.2.1** is the last release that supports it; pin the upstream package:
+
+```json
+{
+  "plugin": ["opencode-claude-auth@2.2.1"]
+}
+```
 
 ## Supported models
 
@@ -129,18 +160,19 @@ If only one account is found, the selection prompt is skipped and the plugin use
 
 ## Troubleshooting
 
-| Problem                                                        | Solution                                                                                                                                                                                                      |
-| -------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| "Credentials not found"                                        | Run `claude` to authenticate with Claude Code first                                                                                                                                                           |
-| "Keychain is locked"                                           | Run `security unlock-keychain ~/Library/Keychains/login.keychain-db`                                                                                                                                          |
-| "Token expired and refresh failed"                             | The plugin runs `claude` CLI to refresh automatically. If this fails, re-authenticate manually by running `claude`                                                                                            |
-| Not working on Linux/Windows                                   | Ensure `~/.claude/.credentials.json` exists (or `$CLAUDE_CONFIG_DIR/.credentials.json` if that env var is set). Run `claude` to create it                                                                     |
-| Keychain access denied                                         | Grant access when macOS prompts you                                                                                                                                                                           |
-| Keychain read timed out                                        | Restart Keychain Access (can happen on macOS Tahoe)                                                                                                                                                           |
-| "Credentials are unavailable or expired"                       | Run `claude` to refresh your Claude Code credentials                                                                                                                                                          |
-| Auth keeps failing right after re-authenticating with `claude` | OpenCode may still be holding a refresh token from a previous `/connect` that's now stale. The plugin re-syncs from the keychain automatically on the next refresh; if it's still stuck, run `/connect` again |
-| "Extra usage is required for long context requests"            | Your conversation exceeded 200k tokens. See [Long context (1M)](#long-context-1m) below                                                                                                                       |
-| Plugin not updating to latest version                          | The exact `2.2.1` pin stays in place; `opencode plugin update` skips exact revisions and is not a fix. Moving to another version is a separately approved config edit after that version is published         |
+| Problem                                                                               | Solution                                                                                                                                                                                                      |
+| ------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| "Credentials not found"                                                               | Run `claude` to authenticate with Claude Code first                                                                                                                                                           |
+| "Keychain is locked"                                                                  | Run `security unlock-keychain ~/Library/Keychains/login.keychain-db`                                                                                                                                          |
+| "Token expired and refresh failed"                                                    | The plugin runs `claude` CLI to refresh automatically. If this fails, re-authenticate manually by running `claude`                                                                                            |
+| Not working on Linux/Windows                                                          | Ensure `~/.claude/.credentials.json` exists (or `$CLAUDE_CONFIG_DIR/.credentials.json` if that env var is set). Run `claude` to create it                                                                     |
+| Keychain access denied                                                                | Grant access when macOS prompts you                                                                                                                                                                           |
+| Keychain read timed out                                                               | Restart Keychain Access (can happen on macOS Tahoe)                                                                                                                                                           |
+| "Credentials are unavailable or expired"                                              | Run `claude` to refresh your Claude Code credentials                                                                                                                                                          |
+| Auth keeps failing right after re-authenticating with `claude`                        | OpenCode may still be holding a refresh token from a previous `/connect` that's now stale. The plugin re-syncs from the keychain automatically on the next refresh; if it's still stuck, run `/connect` again |
+| "Extra usage is required for long context requests"                                   | Your conversation exceeded 200k tokens. See [Long context (1M)](#long-context-1m) below                                                                                                                       |
+| Plugin not updating to a newer version                                                | The install pins an exact version, so it never moves on its own. Change the version in the `plugins` entry to the newer release and restart OpenCode                                                          |
+| `opencode auth login` prints "Only http and https links can be opened in the browser" | Harmless: importing has no browser step, but the CLI tries to open one anyway. The credential is still saved — confirm with `opencode auth list`                                                              |
 
 ### Diagnostic logging
 
@@ -214,6 +246,7 @@ export ANTHROPIC_CLI_VERSION=2.2.0
 - On macOS, enumerates all `Claude Code-credentials*` Keychain entries and labels them by subscription tier; multiple accounts are offered as a selection prompt during `/connect`
 - OpenCode persists the resulting OAuth credential (access + refresh token) itself and calls back into the plugin's `refresh` hook whenever it decides one is needed — the plugin doesn't run its own background timer
 - Before ever attempting a network refresh, re-reads the keychain directly and adopts whatever is there if it differs from the token OpenCode handed back. This keeps things working if `claude` rotated credentials independently of this connection (an interactive re-login, its own periodic refresh, ...) — otherwise OpenCode would keep retrying the same now-dead refresh token on every call, forever
+- OpenCode's `refresh` callback and the request path share one in-flight refresh per account behind a cross-process lock, so they never spend the same single-use refresh token twice
 - Refreshes directly via `POST https://claude.ai/v1/oauth/token` using the runtime's own `fetch` (no LLM tokens consumed, no subprocess); falls back to the `claude` CLI only within the window where Claude Code will actually rotate the token, and writes new tokens back to Keychain (macOS) or the credentials file (Linux/Windows) to keep stored credentials in sync
 - Retries API requests on 429 (rate limit) and 529 (overloaded) with exponential backoff, respecting `retry-after` headers
 - On a 401, recovers in place rather than surfacing it: adopts an externally rotated token if the keychain now holds one, otherwise forces an OAuth refresh, then retries the request

@@ -19,6 +19,7 @@ import {
 import { resetExcludedBetas } from "./betas.ts"
 import { fetchWithRetry } from "./http.ts"
 import { log } from "./logger.ts"
+import { getUserAgent } from "./model-config.ts"
 import {
   classifyRefreshFailure,
   clearRefreshOutcome,
@@ -44,13 +45,7 @@ const accountCacheMap = new Map<
   string,
   { creds: ClaudeCredentials; cachedAt: number }
 >()
-// Capture provenance with the result, not by inspecting a mutable account
-// after awaiting it: a joiner may hold a different object for the same source.
-type CoordinatedRefreshResult = {
-  creds: ClaudeCredentials
-  borrowed?: boolean
-} | null
-const inFlightRefreshes = new Map<string, Promise<CoordinatedRefreshResult>>()
+const inFlightRefreshes = new Map<string, Promise<ClaudeCredentials | null>>()
 
 // Accounts currently running on credentials borrowed from another account.
 // Those tokens belong to the lender: they must never be used as this
@@ -342,7 +337,11 @@ export async function refreshViaOAuthDetailed(
     log("refresh_started", { source: "oauth" })
     const response = await fetchWithRetry(OAUTH_TOKEN_URL, {
       method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        // OpenCode's default User-Agent can trigger a 429 at the token endpoint.
+        "User-Agent": getUserAgent(),
+      },
       body: body.toString(),
       signal: controller.signal,
     })
@@ -460,17 +459,13 @@ function refreshViaCli(configDir?: string, requireConfigDir = false): boolean {
  * the account resolution (via getActiveAccount()) stays correct regardless
  * of threshold, so this always operates on the currently active account
  * unless one is explicitly passed in.
- * Durable credential callers must set `ownSourceOnly`: request-path lending
- * remains available by default, but must not be persisted as this source.
  */
 export async function refreshIfNeeded(
   account?: ClaudeAccount,
   thresholdMs = 60_000,
-  ownSourceOnly = false,
 ): Promise<ClaudeCredentials | null> {
   const target = account ?? getActiveAccount()
   if (!target) return null
-  let own = borrowedCredentialAccounts.has(target) ? null : target.credentials
 
   // Pick up credentials replaced externally — cswap switching accounts, the
   // claude CLI in another terminal, or a second OpenCode instance. This was
@@ -506,16 +501,12 @@ export async function refreshIfNeeded(
   try {
     const stored = refreshAccount(target.source, target.configDir)
     const now = Date.now()
-    // Even when a near-expiry own token cannot replace a healthy loan on the
-    // request path, it can still serve the durable source-specific caller.
-    if (stored && !own) own = stored
     if (
       stored &&
       (stored.expiresAt > now + 60_000 ||
         target.credentials.expiresAt <= now + 60_000)
     ) {
       target.credentials = stored
-      own = stored
       // Read from this account's own source, so what it returned is this
       // account's own credentials — it is no longer running on a lender's.
       borrowedCredentialAccounts.delete(target)
@@ -527,33 +518,8 @@ export async function refreshIfNeeded(
     })
   }
 
-  const resolve = (result: CoordinatedRefreshResult) => {
-    if (result && (!ownSourceOnly || !result.borrowed)) return result.creds
-    return ownSourceOnly && own && own.expiresAt > Date.now() ? own : null
-  }
   const creds = target.credentials
-  if (creds.expiresAt > Date.now() + thresholdMs) {
-    return resolve({ creds, borrowed: borrowedCredentialAccounts.has(target) })
-  }
-
-  return resolve(
-    await coordinateRefresh(target, creds, () => performRefresh(target, creds)),
-  )
-}
-
-/** One coordinator for scheduled refresh, request refresh, and forced 401 recovery. */
-async function coordinateRefresh(
-  target: ClaudeAccount,
-  creds: ClaudeCredentials,
-  perform: () => Promise<CoordinatedRefreshResult>,
-): Promise<CoordinatedRefreshResult> {
-  // A joiner must consume the existing attempt's provenance even if its
-  // account object or refresh semantics differ from those of the initiator.
-  const inFlight = inFlightRefreshes.get(target.source)
-  if (inFlight) {
-    log("refresh_joined", { source: target.source })
-    return inFlight
-  }
+  if (creds.expiresAt > Date.now() + thresholdMs) return creds
 
   // If a recent refresh was rate-limited, don't re-hit the endpoint until the
   // cooldown clears — adopt a sibling instance's / the CLI's fresh token if one
@@ -565,12 +531,22 @@ async function coordinateRefresh(
     isRefreshCooldownActive(target.source)
   ) {
     const adopted = adoptFreshFromSource(target, creds.accessToken)
-    if (adopted) return { creds: adopted }
+    if (adopted) return adopted
     log("refresh_cooldown_skip", {
       source: target.source,
       until: getRefreshCooldownUntil(target.source),
     })
     return null
+  }
+
+  // The proactive sync timer calls this directly while the request path
+  // arrives via getCachedCredentials(). A rotation invalidates the refresh
+  // token it was issued against, so two concurrent refreshes would leave
+  // one caller holding an already-dead token. Share one attempt instead.
+  const inFlight = inFlightRefreshes.get(target.source)
+  if (inFlight) {
+    log("refresh_joined", { source: target.source })
+    return inFlight
   }
 
   // Cross-process single-flight: only one OpenCode instance / the CLI should
@@ -580,7 +556,7 @@ async function coordinateRefresh(
   if (!lock) {
     log("refresh_lock_busy", { source: target.source })
     const adopted = await waitForAdopt(target, creds.accessToken)
-    if (adopted) return { creds: adopted }
+    if (adopted) return adopted
     // The holder produced nothing within the window (likely crashed; its lock
     // ages out by TTL). Defer rather than refresh lock-free, so we don't
     // recreate the burst the lock exists to prevent — the request-level wait
@@ -590,7 +566,7 @@ async function coordinateRefresh(
 
   const pending = (async () => {
     try {
-      return await perform()
+      return await performRefresh(target, creds)
     } finally {
       lock.release()
     }
@@ -601,6 +577,18 @@ async function coordinateRefresh(
   } finally {
     inFlightRefreshes.delete(target.source)
   }
+}
+
+/**
+ * Rotate the account's tokens now, however long they have left. Goes through
+ * refreshIfNeeded, so it joins an in-flight exchange and takes the
+ * cross-process lock: OpenCode's own refresh callback and the request path
+ * can't both spend the same refresh token.
+ */
+export function rotateAccountCredentials(
+  account: ClaudeAccount,
+): Promise<ClaudeCredentials | null> {
+  return refreshIfNeeded(account, Number.POSITIVE_INFINITY)
 }
 
 /**
@@ -672,7 +660,7 @@ async function waitForAdopt(
 async function performRefresh(
   target: ClaudeAccount,
   creds: ClaudeCredentials,
-): Promise<CoordinatedRefreshResult> {
+): Promise<ClaudeCredentials | null> {
   if (borrowedCredentialAccounts.has(target)) {
     return refreshBorrowedAccount(target)
   }
@@ -708,7 +696,7 @@ async function performRefresh(
         // the validated re-read — is tracked as a follow-up.
         log("refresh_writeback_failed", { source: target.source })
       }
-      return { creds: outcome.creds }
+      return outcome.creds
     }
 
     if (outcome.kind === "transient") {
@@ -727,17 +715,16 @@ async function performRefresh(
         cooldownMs,
       })
       const adopted = adoptFreshFromSource(target, creds.accessToken)
-      if (adopted) return { creds: adopted }
+      if (adopted) return adopted
       // Keep serving still-usable credentials on the proactive path.
-      if (creds.expiresAt > Date.now() + CLI_FALLBACK_THRESHOLD_MS)
-        return { creds }
+      if (creds.expiresAt > Date.now() + CLI_FALLBACK_THRESHOLD_MS) return creds
       // Borrow a sibling account's still-valid token rather than spawning the
       // claude CLI, which hits the same rate-limited endpoint.
       const borrowed = tryFallbackAccount(target.source)
       if (borrowed) {
         target.credentials = borrowed
         borrowedCredentialAccounts.add(target)
-        return { creds: borrowed, borrowed: true }
+        return borrowed
       }
       return null
     }
@@ -766,7 +753,7 @@ async function performRefresh(
       reason: "credentials still usable",
       expiresIn: creds.expiresAt - Date.now(),
     })
-    return { creds }
+    return creds
   }
 
   // Every OpenCode instance refreshes independently, and a rotation
@@ -794,7 +781,7 @@ async function performRefresh(
     ) {
       target.credentials = stored
       log("refresh_adopted_external", { source: target.source })
-      return { creds: stored }
+      return stored
     }
   }
 
@@ -808,7 +795,7 @@ async function performRefresh(
     if (fallback) {
       target.credentials = fallback
       borrowedCredentialAccounts.add(target)
-      return { creds: fallback, borrowed: true }
+      return fallback
     }
 
     log("refresh_exhausted", {
@@ -827,17 +814,12 @@ async function performRefresh(
     const primaryRefreshed = refreshAccount(PRIMARY_SERVICE)
     if (primaryRefreshed && primaryRefreshed.expiresAt > Date.now() + 60_000) {
       refreshed = primaryRefreshed
-      // A primary read does not establish ownership by this suffixed source.
-      borrowedCredentialAccounts.add(target)
     }
   }
 
   if (refreshed && refreshed.expiresAt > Date.now() + 60_000) {
     target.credentials = refreshed
-    return {
-      creds: refreshed,
-      borrowed: borrowedCredentialAccounts.has(target),
-    }
+    return refreshed
   }
 
   log("refresh_exhausted", {
@@ -857,7 +839,7 @@ async function performRefresh(
  */
 async function refreshBorrowedAccount(
   target: ClaudeAccount,
-): Promise<CoordinatedRefreshResult> {
+): Promise<ClaudeCredentials | null> {
   log("refresh_borrowed", { source: target.source })
 
   let own: ClaudeCredentials | null = null
@@ -871,7 +853,7 @@ async function refreshBorrowedAccount(
     borrowedCredentialAccounts.delete(target)
     target.credentials = own
     log("refresh_borrowed_recovered", { source: target.source, via: "source" })
-    return { creds: own }
+    return own
   }
 
   // A refresh token outlives its access token by weeks, so this account's
@@ -890,14 +872,14 @@ async function refreshBorrowedAccount(
         own.accessToken,
       )
       log("refresh_borrowed_recovered", { source: target.source, via: "oauth" })
-      return { creds: oauthCreds }
+      return oauthCreds
     }
   }
 
   const again = tryFallbackAccount(target.source)
   if (again) {
     target.credentials = again
-    return { creds: again, borrowed: true }
+    return again
   }
 
   // Recovery failed. The account must not be left holding the lender's
@@ -1002,7 +984,9 @@ export function reloadActiveAccount(): void {
  * The refresh function is injectable for tests.
  */
 export async function forceRefreshActiveAccount(
-  refresh?: (refreshToken: string) => Promise<ClaudeCredentials | null>,
+  refresh: (
+    refreshToken: string,
+  ) => Promise<ClaudeCredentials | null> = refreshViaOAuth,
   account: ClaudeAccount | null = getActiveAccount(),
 ): Promise<ClaudeCredentials | null> {
   if (!account?.credentials.refreshToken) return null
@@ -1015,66 +999,31 @@ export async function forceRefreshActiveAccount(
     return null
   }
 
-  const prior = account.credentials
-  const result = await coordinateRefresh(account, prior, async () => {
-    let outcome: RefreshOutcome
-    if (refresh) {
-      const fresh = await refresh(prior.refreshToken)
-      outcome = fresh
-        ? { kind: "ok", creds: fresh }
-        : { kind: "transient", status: 0 }
-    } else {
-      outcome = await refreshViaOAuthDetailed(prior.refreshToken)
-    }
+  const priorAccessToken = account.credentials.accessToken
+  const oauthCreds = await refresh(account.credentials.refreshToken)
+  if (oauthCreds && oauthCreds.expiresAt > Date.now() + 60_000) {
+    account.credentials = oauthCreds
     if (
-      outcome.kind === "ok" &&
-      outcome.creds.expiresAt > Date.now() + 60_000 &&
-      outcome.creds.accessToken !== prior.accessToken
+      !writeBackCredentials(
+        account.source,
+        oauthCreds,
+        account.configDir,
+        priorAccessToken,
+      )
     ) {
-      const oauthCreds = outcome.creds
-      clearRefreshOutcome(account.source)
-      account.credentials = oauthCreds
-      if (
-        !writeBackCredentials(
-          account.source,
-          oauthCreds,
-          account.configDir,
-          prior.accessToken,
-        )
-      ) {
-        // Preserve the forced path's write-back diagnostics. A failed write
-        // still leaves memory usable; resolving I/O versus CAS failure is a
-        // separate concern from coordinating the token exchange.
-        log("force_refresh_writeback_failed", { source: account.source })
-      }
-      return { creds: oauthCreds }
+      // Session continues from memory/cache either way, but the two causes
+      // diverge on a later source re-read. An I/O failure leaves our own
+      // rejected token in the store, so the re-read resurrects it and
+      // triggers another refresh. A CAS mismatch means the store now holds
+      // another account's token, so the re-read adopts that instead and this
+      // account stops using the credentials it just refreshed.
+      log("force_refresh_writeback_failed", { source: account.source })
     }
-    if (outcome.kind === "transient") {
-      noteRefreshTransient(account.source, {
-        retryAfterMs: outcome.retryAfterMs,
-      })
-    } else if (outcome.kind === "terminal") {
-      noteRefreshTerminal(account.source)
-    }
-    // Forced failures must not fall through to the CLI, lending, or the
-    // still-unexpired access token that the API already rejected.
-    return null
-  })
-  if (
-    result &&
-    !result.borrowed &&
-    result.creds.accessToken !== prior.accessToken &&
-    result.creds.expiresAt > Date.now() + 60_000
-  ) {
-    // Joined normal refreshes and lock-holder adoption also refresh this
-    // caller's account/cache, but only the initiating attempt writes back.
-    account.credentials = result.creds
-    borrowedCredentialAccounts.delete(account)
     accountCacheMap.set(account.source, {
-      creds: result.creds,
+      creds: oauthCreds,
       cachedAt: Date.now(),
     })
-    return result.creds
+    return oauthCreds
   }
 
   log("force_refresh_failed", { source: account.source })

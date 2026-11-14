@@ -12,7 +12,7 @@ export interface ModelConfig {
 }
 
 export const config: ModelConfig = {
-  ccVersion: "2.1.284",
+  ccVersion: "2.1.325",
   baseBetas: [
     "claude-code-20250219",
     "oauth-2025-04-20",
@@ -63,4 +63,11 @@ export function getModelOverride(modelId: string): ModelOverride | null {
     if (lower.includes(pattern)) return override
   }
   return null
+}
+
+export function getUserAgent(): string {
+  return (
+    process.env.ANTHROPIC_USER_AGENT ??
+    `claude-cli/${process.env.ANTHROPIC_CLI_VERSION ?? config.ccVersion} (external, sdk-cli)`
+  )
 }

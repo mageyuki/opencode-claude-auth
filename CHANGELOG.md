@@ -1,5 +1,24 @@
 # Changelog
 
+## 3.0.1 (2026-11-14)
+
+Fork release of `@mageyuki/opencode-claude-auth` (unofficial), based on upstream `opencode-claude-auth` [3.0.0](https://github.com/griffinmartin/opencode-claude-auth/tree/v3.0.0).
+
+### Bug Fixes
+
+* update Claude Code version to 2.1.325 for Fable 5.2 ([griffinmartin/opencode-claude-auth#298](https://github.com/griffinmartin/opencode-claude-auth/issues/298))
+
+## [3.0.0](https://github.com/griffinmartin/opencode-claude-auth/compare/v2.2.1...v3.0.0) (2026-10-16)
+
+
+### ⚠ BREAKING CHANGES
+
+* OpenCode 1 is no longer supported. The plugin now targets OpenCode 2's plugin and auth APIs and must be listed under `plugins` instead of `plugin`. OpenCode 1 users should pin `opencode-claude-auth@2.2.1`.
+
+### Features
+
+* support OpenCode 2 ([#274](https://github.com/griffinmartin/opencode-claude-auth/issues/274)) ([4c4b6cf](https://github.com/griffinmartin/opencode-claude-auth/commit/4c4b6cf1f7249e7ce1faa471d85e7a048d468b83))
+
 ## [2.2.1](https://github.com/griffinmartin/opencode-claude-auth/compare/v2.2.0...v2.2.1) (2026-09-22)
 
 
