@@ -12,15 +12,19 @@ Self-contained Anthropic auth provider for OpenCode 2 using your Claude Code sub
 
 | Package                                | OpenCode  | Config key | Install                                |
 | -------------------------------------- | --------- | ---------- | -------------------------------------- |
-| `@mageyuki/opencode-claude-auth` 3.0.1 | 2.0+ only | `plugins`  | `@mageyuki/opencode-claude-auth@3.0.1` |
+| `@mageyuki/opencode-claude-auth` 3.0.2 | 2.0+ only | `plugins`  | `@mageyuki/opencode-claude-auth@3.0.2` |
 | upstream `opencode-claude-auth` 2.2.1  | 1.x       | `plugin`   | `opencode-claude-auth@2.2.1`           |
 
 ## Divergence from upstream
 
-Version 3.0.1 of this fork is upstream `opencode-claude-auth` [3.0.0](https://github.com/griffinmartin/opencode-claude-auth/tree/v3.0.0) plus:
+Version 3.0.2 of this fork is upstream `opencode-claude-auth` [3.0.0](https://github.com/griffinmartin/opencode-claude-auth/tree/v3.0.0) plus:
 
 - Claude Code version update to 2.1.325, required by Fable 5.2 (upstream issue [#298](https://github.com/griffinmartin/opencode-claude-auth/issues/298)).
+- Lent tokens are never saved as a connection's credential. With more than one Claude Code account on the machine, the plugin can lend an account another account's tokens when its own refresh fails, so a running session keeps working. Those lent tokens are no longer saved as the borrowing account's OpenCode credential, neither when OpenCode refreshes the connection nor when `/connect` imports it.
+- Cancelling a model request also ends the plugin's wait (up to 45 seconds) for credentials while a token refresh is backing off.
 - Package metadata for the scoped name (`@mageyuki/opencode-claude-auth`, repository/bugs/homepage pointing at the fork, public access).
+
+Not included yet: coordinating the forced token refresh that runs after a 401 response with other refreshes of the same account.
 
 The scoped name is a separate npm package, so its version numbers do not track upstream's.
 
@@ -81,11 +85,11 @@ Install the @mageyuki/opencode-claude-auth plugin and configure it by following:
 
    ```json
    {
-     "plugins": ["@mageyuki/opencode-claude-auth@3.0.1"]
+     "plugins": ["@mageyuki/opencode-claude-auth@3.0.2"]
    }
    ```
 
-   > OpenCode 2 uses the `plugins` key (plural) — OpenCode 1 used `plugin` (singular). The version is pinned to the release `3.0.1` for reproducible installs; keep any existing plugin entries in the array unchanged. You can also run `opencode plugin add @mageyuki/opencode-claude-auth@3.0.1`. No manual `npm install` is needed — OpenCode installs package plugins itself (see the [OpenCode 2 plugins guide](https://opencode.ai/v2/docs/plugins)).
+   > OpenCode 2 uses the `plugins` key (plural) — OpenCode 1 used `plugin` (singular). The version is pinned to the release `3.0.2` for reproducible installs; keep any existing plugin entries in the array unchanged. You can also run `opencode plugin add @mageyuki/opencode-claude-auth@3.0.2`. No manual `npm install` is needed — OpenCode installs package plugins itself (see the [OpenCode 2 plugins guide](https://opencode.ai/v2/docs/plugins)).
 
 2. **Connect it** — restart OpenCode, run `/connect`, choose **Anthropic**, then **Import Claude Code subscription**. Use `/models` and pick a model under **Anthropic**.
 
@@ -106,7 +110,7 @@ OpenCode 2 replaced the plugin and auth APIs this plugin used under OpenCode 1, 
 
    ```json
    {
-     "plugins": ["@mageyuki/opencode-claude-auth@3.0.1"]
+     "plugins": ["@mageyuki/opencode-claude-auth@3.0.2"]
    }
    ```
 

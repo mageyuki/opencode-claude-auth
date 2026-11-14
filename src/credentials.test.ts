@@ -8,6 +8,11 @@ import {
 } from "./credentials.ts"
 import { Writable } from "node:stream"
 import { closeLogger, initLogger } from "./logger.ts"
+import {
+  buildOAuthCredential,
+  refreshOAuthCredential,
+  type OAuthDeps,
+} from "./oauth-method.ts"
 import { acquireRefreshLock } from "./refresh-lock.ts"
 import {
   chmodSync,
@@ -57,6 +62,11 @@ async function loadCredentialsWithCountingKeychain(
       thresholdMs?: number,
     ) => Promise<Creds | null>
     rotateAccountCredentials: (account: {
+      label: string
+      source: string
+      credentials: Creds
+    }) => Promise<Creds | null>
+    getOwnSourceCredentials: (account: {
       label: string
       source: string
       credentials: Creds
@@ -1948,6 +1958,19 @@ function makeAccount(expiresAt: number) {
   }
 }
 
+// Another account on the machine whose still-valid tokens can be lent.
+function makeSibling(now: number) {
+  return {
+    label: "Account 2",
+    source: "sibling",
+    credentials: {
+      accessToken: "lender-access",
+      refreshToken: "lender-refresh",
+      expiresAt: now + 3_600_000,
+    },
+  }
+}
+
 describe("refreshIfNeeded CLI fallback scope", () => {
   it("refreshes via OAuth without spawning the claude CLI", async () => {
     const originalFetch = globalThis.fetch
@@ -2419,6 +2442,305 @@ describe("borrowed fallback credentials", () => {
         "guarding with the lender's token would fail every CAS",
       )
     } finally {
+      globalThis.fetch = originalFetch
+      Date.now = originalNow
+    }
+  })
+
+  // After the claude CLI runs, a suffixed account whose own entry is still
+  // expired takes the primary service's token. That keeps the request going,
+  // but the token is the primary account's: saving it as the suffixed
+  // connection, or force-refreshing it as that account, spends the primary
+  // account's refresh token on the suffixed account's behalf.
+  it("never persists primary CLI fallback as a suffixed source", async () => {
+    const originalFetch = globalThis.fetch
+    const originalNow = Date.now
+    const now = 1_700_000_000_000
+    Date.now = () => now
+    globalThis.fetch = (async () =>
+      new Response(JSON.stringify({ error: "invalid_grant" }), {
+        status: 400,
+      })) as typeof fetch
+
+    try {
+      const { credentialsModule, keychainModule, childProcessModule } =
+        await loadCredentialsWithCountingKeychain(now - 1)
+      const target = {
+        ...makeAccount(now - 1),
+        source: "Claude Code-credentials-suffixed",
+        // A known configDir lets the CLI fallback run for a suffixed source.
+        configDir: "/synthetic/claude",
+      }
+      credentialsModule.initAccounts([target])
+      keychainModule.__setCredentialsForSource(target.source, {
+        ...target.credentials,
+      })
+      keychainModule.__setCredentialsForSource("Claude Code-credentials", {
+        accessToken: "primary-access",
+        refreshToken: "primary-refresh",
+        expiresAt: now + 3_600_000,
+      })
+      const deps = {
+        setActiveAccountSource: credentialsModule.setActiveAccountSource,
+        reloadCredentialsFromSource:
+          credentialsModule.reloadCredentialsFromSource,
+        getAccountBySource: credentialsModule.getAccountBySource,
+        rotateAccountCredentials: credentialsModule.rotateAccountCredentials,
+        log: () => {},
+      } as unknown as OAuthDeps
+      const value = {
+        type: "oauth" as const,
+        access: "existing-token",
+        refresh: "existing-refresh",
+        metadata: { source: target.source, configDir: target.configDir },
+      }
+
+      await assert.rejects(
+        refreshOAuthCredential(value, deps),
+        /re-authenticate/,
+      )
+      assert.equal(
+        childProcessModule.__getExecSyncCount(),
+        1,
+        "precondition: the CLI fallback ran",
+      )
+      assert.equal(
+        target.credentials.accessToken,
+        "primary-access",
+        "request-path lending is kept",
+      )
+      assert.equal(
+        await credentialsModule.forceRefreshActiveAccount(async () =>
+          assert.fail("must not exchange the primary token as this source"),
+        ),
+        null,
+      )
+      assert.deepEqual(keychainModule.__getWrites(), [])
+    } finally {
+      globalThis.fetch = originalFetch
+      Date.now = originalNow
+    }
+  })
+
+  // `/connect` imports what it is given as the selected account's saved
+  // credential. A loan must never be that credential, even when the own one
+  // has expired: it would bill the lender from then on.
+  function importDeps(
+    credentialsModule: Awaited<
+      ReturnType<typeof loadCredentialsWithCountingKeychain>
+    >["credentialsModule"],
+    accounts: unknown[],
+  ): OAuthDeps {
+    return {
+      refreshAccountsList: () => accounts,
+      setActiveAccountSource: () => {},
+      saveAccountSource: () => {},
+      getCachedCredentials: credentialsModule.getCachedCredentials,
+      getOwnSourceCredentials: credentialsModule.getOwnSourceCredentials,
+    } as unknown as OAuthDeps
+  }
+
+  it("imports its own token with 30s left, not the loan", async () => {
+    const originalFetch = globalThis.fetch
+    const originalNow = Date.now
+    const now = 1_700_000_000_000
+    Date.now = () => now
+    globalThis.fetch = (async () => {
+      throw new Error("synthetic outage")
+    }) as typeof fetch
+
+    try {
+      const { credentialsModule, keychainModule } =
+        await loadCredentialsWithCountingKeychain(now + 30_000)
+      const target = makeAccount(now + 30_000)
+      const lender = makeSibling(now)
+      credentialsModule.initAccounts([target, lender])
+      keychainModule.__setCredentialsForSource(target.source, {
+        ...target.credentials,
+      })
+
+      const imported = await buildOAuthCredential(
+        target.source,
+        importDeps(credentialsModule, [target, lender]),
+      )
+
+      assert.equal(imported.access, "existing-token")
+      assert.equal(imported.refresh, "existing-refresh")
+      assert.equal(imported.expires, now + 30_000)
+      assert.equal(imported.metadata?.source, target.source)
+    } finally {
+      globalThis.fetch = originalFetch
+      Date.now = originalNow
+    }
+  })
+
+  it("imports its own expired snapshot, not the loan", async () => {
+    const originalFetch = globalThis.fetch
+    const originalNow = Date.now
+    const now = 1_700_000_000_000
+    Date.now = () => now
+    globalThis.fetch = (async () => {
+      throw new Error("synthetic outage")
+    }) as typeof fetch
+
+    try {
+      const { credentialsModule, keychainModule } =
+        await loadCredentialsWithCountingKeychain(now - 1)
+      const target = makeAccount(now - 1)
+      const lender = makeSibling(now)
+      credentialsModule.initAccounts([target, lender])
+      keychainModule.__setCredentialsForSource(target.source, {
+        ...target.credentials,
+      })
+
+      const imported = await buildOAuthCredential(
+        target.source,
+        importDeps(credentialsModule, [target, lender]),
+      )
+
+      assert.equal(imported.access, "existing-token")
+      assert.equal(imported.expires, now - 1)
+    } finally {
+      globalThis.fetch = originalFetch
+      Date.now = originalNow
+    }
+  })
+
+  it("a borrowed account with an unreadable store is never imported with the loan", async () => {
+    const originalFetch = globalThis.fetch
+    const originalNow = Date.now
+    const now = 1_700_000_000_000
+    Date.now = () => now
+    globalThis.fetch = (async () => {
+      throw new Error("synthetic outage")
+    }) as typeof fetch
+
+    try {
+      const { credentialsModule, keychainModule } =
+        await loadCredentialsWithCountingKeychain(now + 30_000)
+      const target = makeAccount(now + 30_000)
+      const lender = makeSibling(now)
+      credentialsModule.initAccounts([target, lender])
+      keychainModule.__setCredentialsForSource(target.source, {
+        ...target.credentials,
+      })
+      await credentialsModule.refreshIfNeeded(target)
+      assert.equal(
+        target.credentials.accessToken,
+        "lender-access",
+        "precondition: the account is running on the lender's tokens",
+      )
+      keychainModule.__setReadError(true)
+
+      await assert.rejects(
+        buildOAuthCredential(
+          target.source,
+          importDeps(credentialsModule, [target, lender]),
+        ),
+        /authenticate/,
+      )
+      assert.deepEqual(keychainModule.__getWrites(), [])
+    } finally {
+      globalThis.fetch = originalFetch
+      Date.now = originalNow
+    }
+  })
+
+  // While a borrowed account's own-token exchange is in flight, another
+  // caller can adopt a fresh own token from the store, which clears the
+  // borrowed mark. If the exchange then fails and the account borrows again,
+  // it holds the lender's tokens and must be marked as borrowed again, or
+  // they pass for its own on the next import or rotation.
+  it("keeps a re-borrowed account marked after a concurrent own-store adoption", async () => {
+    const originalFetch = globalThis.fetch
+    const originalNow = Date.now
+    const now = 1_700_000_000_000
+    let clock = now
+    Date.now = () => clock
+    let release!: () => void
+    let gate: Promise<void> | null = null
+    const sentRefreshTokens: string[] = []
+    globalThis.fetch = (async (_url: string | URL, init?: RequestInit) => {
+      sentRefreshTokens.push(
+        String(
+          new URLSearchParams(String(init?.body ?? "")).get("refresh_token"),
+        ),
+      )
+      if (gate) await gate
+      throw new Error("synthetic outage")
+    }) as typeof fetch
+    const started: Promise<unknown>[] = []
+
+    try {
+      const { credentialsModule, keychainModule } =
+        await loadCredentialsWithCountingKeychain(now + 30_000)
+      const target = makeAccount(now + 30_000)
+      credentialsModule.initAccounts([target, makeSibling(now)])
+      keychainModule.__setCredentialsForSource(target.source, {
+        ...target.credentials,
+      })
+      await credentialsModule.refreshIfNeeded(target)
+      assert.equal(
+        target.credentials.accessToken,
+        "lender-access",
+        "precondition: the account is running on the lender's tokens",
+      )
+
+      // The account's own recovery exchanges its own stored refresh token,
+      // held at the token endpoint.
+      gate = new Promise<void>((resolve) => {
+        release = resolve
+      })
+      sentRefreshTokens.length = 0
+      const recovery = credentialsModule.rotateAccountCredentials(target)
+      started.push(recovery)
+      assert.deepEqual(
+        sentRefreshTokens,
+        ["existing-refresh"],
+        "precondition: the own-token exchange is in flight",
+      )
+
+      // Meanwhile a fresh own token appears in the store and a request adopts it.
+      keychainModule.__setCredentialsForSource(target.source, {
+        accessToken: "own-fresh",
+        refreshToken: "own-fresh-refresh",
+        expiresAt: now + 8 * 60 * 60_000,
+      })
+      assert.equal(
+        (await credentialsModule.refreshIfNeeded(target))?.accessToken,
+        "own-fresh",
+        "precondition: a concurrent request adopted the own token",
+      )
+
+      // The held exchange fails and the account borrows again.
+      release()
+      assert.equal(await recovery, null)
+      assert.equal(
+        target.credentials.accessToken,
+        "lender-access",
+        "precondition: the account borrowed again",
+      )
+
+      // Its own store becomes unreadable, and the cooldown from the first
+      // failure has passed.
+      keychainModule.__setReadError(true)
+      clock = now + 61_000
+      sentRefreshTokens.length = 0
+      const imported = await credentialsModule.getOwnSourceCredentials(target)
+      const rotated = await credentialsModule.rotateAccountCredentials(target)
+
+      assert.deepEqual(
+        {
+          imported: imported?.accessToken ?? null,
+          rotated: rotated?.accessToken ?? null,
+          sentRefreshTokens,
+        },
+        { imported: null, rotated: null, sentRefreshTokens: [] },
+      )
+      assert.deepEqual(keychainModule.__getWrites(), [])
+    } finally {
+      release?.()
+      await Promise.allSettled(started)
       globalThis.fetch = originalFetch
       Date.now = originalNow
     }
@@ -3096,6 +3418,167 @@ describe("rotateAccountCredentials", () => {
           .__getWrites()
           .map((write) => [write.source, write.expectedPriorAccessToken]),
         [["keychain", "existing-token"]],
+      )
+    } finally {
+      globalThis.fetch = originalFetch
+      Date.now = originalNow
+    }
+  })
+
+  // OpenCode saves whatever its refresh callback returns as this connection's
+  // credential. A sibling's loan keeps a request alive, but saved here it
+  // bills the sibling and later spends the sibling's refresh token.
+  it("never returns a sibling's loan when its own refresh fails", async () => {
+    const originalFetch = globalThis.fetch
+    const originalNow = Date.now
+    const now = 1_700_000_000_000
+    Date.now = () => now
+    let exchanges = 0
+    globalThis.fetch = (async () => {
+      exchanges += 1
+      throw new Error("synthetic outage")
+    }) as typeof fetch
+
+    try {
+      const { credentialsModule, keychainModule } =
+        await loadCredentialsWithCountingKeychain(now + 30_000)
+      const target = makeAccount(now + 30_000)
+      credentialsModule.initAccounts([target, makeSibling(now)])
+      keychainModule.__setCredentialsForSource(target.source, {
+        ...target.credentials,
+      })
+
+      assert.equal(
+        await credentialsModule.rotateAccountCredentials(target),
+        null,
+      )
+      assert.equal(exchanges, 1)
+      assert.deepEqual(keychainModule.__getWrites(), [])
+    } finally {
+      globalThis.fetch = originalFetch
+      Date.now = originalNow
+    }
+  })
+
+  it("never returns a sibling's loan after the claude CLI fallback fails", async () => {
+    const originalFetch = globalThis.fetch
+    const originalNow = Date.now
+    const now = 1_700_000_000_000
+    Date.now = () => now
+    let exchanges = 0
+    globalThis.fetch = (async () => {
+      exchanges += 1
+      return new Response(JSON.stringify({ error: "invalid_grant" }), {
+        status: 400,
+      })
+    }) as typeof fetch
+
+    try {
+      const { credentialsModule, keychainModule } =
+        await loadCredentialsWithCountingKeychain(now + 30_000)
+      // A suffixed source with no known configDir: the CLI fallback fails.
+      const target = {
+        ...makeAccount(now + 30_000),
+        source: "Claude Code-credentials-suffixed",
+      }
+      credentialsModule.initAccounts([target, makeSibling(now)])
+      keychainModule.__setCredentialsForSource(target.source, {
+        ...target.credentials,
+      })
+
+      assert.equal(
+        await credentialsModule.rotateAccountCredentials(target),
+        null,
+      )
+      assert.equal(
+        target.credentials.accessToken,
+        "lender-access",
+        "precondition: the sibling's tokens were lent",
+      )
+      assert.equal(exchanges, 1)
+      assert.deepEqual(keychainModule.__getWrites(), [])
+    } finally {
+      globalThis.fetch = originalFetch
+      Date.now = originalNow
+    }
+  })
+
+  // Whether a result was lent is decided by the attempt that produced it. A
+  // rotation joining a request-path attempt takes that verdict, even when it
+  // holds a different object for the same source.
+  it("a joiner gets null when the in-flight request refresh lent", async () => {
+    const originalFetch = globalThis.fetch
+    const originalNow = Date.now
+    const now = 1_700_000_000_000
+    Date.now = () => now
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    let exchanges = 0
+    globalThis.fetch = (async () => {
+      exchanges += 1
+      await gate
+      throw new Error("synthetic outage")
+    }) as typeof fetch
+    const started: Promise<unknown>[] = []
+
+    try {
+      const { credentialsModule, keychainModule } =
+        await loadCredentialsWithCountingKeychain(now + 30_000)
+      const target = makeAccount(now + 30_000)
+      credentialsModule.initAccounts([target, makeSibling(now)])
+      keychainModule.__setCredentialsForSource(target.source, {
+        ...target.credentials,
+      })
+
+      const viaRequest = credentialsModule.refreshIfNeeded(target)
+      started.push(viaRequest)
+      const viaCallback = credentialsModule.rotateAccountCredentials({
+        ...target,
+        credentials: { ...target.credentials },
+      })
+      started.push(viaCallback)
+      release()
+
+      assert.equal((await viaRequest)?.accessToken, "lender-access")
+      assert.equal(await viaCallback, null)
+      assert.equal(exchanges, 1)
+    } finally {
+      release()
+      await Promise.allSettled(started)
+      globalThis.fetch = originalFetch
+      Date.now = originalNow
+    }
+  })
+
+  it("an already-borrowed account with an unreadable store yields null", async () => {
+    const originalFetch = globalThis.fetch
+    const originalNow = Date.now
+    const now = 1_700_000_000_000
+    Date.now = () => now
+    globalThis.fetch = (async () => {
+      throw new Error("synthetic outage")
+    }) as typeof fetch
+
+    try {
+      const { credentialsModule, keychainModule } =
+        await loadCredentialsWithCountingKeychain(now + 30_000)
+      const target = makeAccount(now + 30_000)
+      credentialsModule.initAccounts([target, makeSibling(now)])
+      keychainModule.__setCredentialsForSource(target.source, {
+        ...target.credentials,
+      })
+      assert.equal(
+        (await credentialsModule.refreshIfNeeded(target))?.accessToken,
+        "lender-access",
+        "precondition: a transient failure lends the sibling's tokens",
+      )
+      keychainModule.__setReadError(true)
+
+      assert.equal(
+        await credentialsModule.rotateAccountCredentials(target),
+        null,
       )
     } finally {
       globalThis.fetch = originalFetch

@@ -3,6 +3,7 @@ import type { IntegrationOAuthMethod } from "@opencode/plugin/promise/integratio
 import {
   getAccountBySource,
   getCachedCredentials,
+  getOwnSourceCredentials,
   loadPersistedAccountSource,
   refreshAccountsList,
   refreshViaOAuth,
@@ -41,7 +42,18 @@ const ACCOUNT_FIELD_KEY = "account"
 export interface OAuthDeps {
   refreshAccountsList: () => ClaudeAccount[]
   loadPersistedAccountSource: () => string | null
+  /**
+   * The request-path cache; can hold another account's lent tokens. Imported
+   * only when {@link OAuthDeps.getOwnSourceCredentials} is absent.
+   */
   getCachedCredentials: () => Promise<ClaudeCredentials | null>
+  /**
+   * The account's own credentials, never another account's lent tokens. When
+   * present, `/connect` imports only this.
+   */
+  getOwnSourceCredentials?: (
+    account: ClaudeAccount,
+  ) => Promise<ClaudeCredentials | null>
   setActiveAccountSource: (source: string) => void
   saveAccountSource: (source: string) => void
   reloadCredentialsFromSource: () => ClaudeCredentials | null
@@ -132,7 +144,19 @@ export async function buildOAuthCredential(
     )
   deps.setActiveAccountSource(account.source)
   deps.saveAccountSource(account.source)
-  const value = (await deps.getCachedCredentials()) ?? account.credentials
+  let value: ClaudeCredentials
+  if (deps.getOwnSourceCredentials) {
+    // What this returns is saved as the selected account's credential, so it
+    // must be that account's own, never a sibling's loan.
+    const own = await deps.getOwnSourceCredentials(account)
+    if (!own)
+      throw new Error(
+        "No Claude Code credentials found. Run `claude` to authenticate first.",
+      )
+    value = own
+  } else {
+    value = (await deps.getCachedCredentials()) ?? account.credentials
+  }
   return Credential.OAuth.make({
     type: "oauth",
     methodID: METHOD_ID,
@@ -272,6 +296,7 @@ export const realOAuthDeps: OAuthDeps = {
   refreshAccountsList,
   loadPersistedAccountSource,
   getCachedCredentials,
+  getOwnSourceCredentials,
   setActiveAccountSource,
   saveAccountSource,
   reloadCredentialsFromSource,

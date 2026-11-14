@@ -1,6 +1,24 @@
 import assert from "node:assert/strict"
-import { describe, it } from "node:test"
 import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs"
+import { tmpdir } from "node:os"
+import { delimiter, join } from "node:path"
+import { Writable } from "node:stream"
+import { describe, it } from "node:test"
+import { closeLogger, initLogger } from "./logger.ts"
+import { clearRefreshOutcome, noteRefreshTransient } from "./refresh-backoff.ts"
+
+// credentials.ts reads its credential wait budget once, when it loads. Load it
+// with the production default, so an inherited override cannot let the
+// cancellation test below pass without ever waiting.
+const inheritedWaitMs = process.env.OPENCODE_CLAUDE_AUTH_REFRESH_WAIT_MS
+delete process.env.OPENCODE_CLAUDE_AUTH_REFRESH_WAIT_MS
+const {
   buildRequestHeaders,
   claudeSubscriptionFetch,
   finishClaudeResponse,
@@ -8,7 +26,9 @@ import {
   prepareClaudeRequest,
   resetExcludedBetas,
   setActiveAccountSource,
-} from "./index.ts"
+} = await import("./index.ts")
+if (inheritedWaitMs !== undefined)
+  process.env.OPENCODE_CLAUDE_AUTH_REFRESH_WAIT_MS = inheritedWaitMs
 
 const messageRequest = () =>
   new Request("https://api.anthropic.com/v1/messages", {
@@ -113,6 +133,123 @@ describe("Claude subscription transport", () => {
     assert.equal(headers.has("x-api-key"), false)
     assert.equal(new URL(request.url).searchParams.get("beta"), "true")
     assert.match(await request.text(), /x-anthropic-billing-header/)
+  })
+
+  // A refresh cooldown holds the request in the credential wait for up to the
+  // 45s budget. Cancelling the model request must end that wait, and the
+  // request goes on with the token it was given.
+  it("stops waiting for transient credential backoff when the request is aborted", async () => {
+    const fixtureDir = mkdtempSync(join(tmpdir(), "claude-auth-cancel-"))
+    // The account's only store is this empty directory.
+    const configDir = join(fixtureDir, "config")
+    const binDir = join(fixtureDir, "bin")
+    const cliMarker = join(fixtureDir, "claude-ran")
+    mkdirSync(configDir)
+    mkdirSync(binDir)
+    // Backstop: the cooldown keeps the wait away from the CLI fallback.
+    writeFileSync(
+      join(binDir, "claude"),
+      `#!/bin/sh\ntouch "${cliMarker}"\nexit 1\n`,
+      { mode: 0o755 },
+    )
+    const realFetch = globalThis.fetch
+    const realPath = process.env.PATH
+    let exchanges = 0
+    globalThis.fetch = (async () => {
+      exchanges += 1
+      throw new Error("network disabled in test")
+    }) as typeof fetch
+    process.env.PATH = `${binDir}${delimiter}${realPath ?? ""}`
+    // The plugin's own debug log shows where the request is: one cache_miss
+    // per credential lookup, and fetch_credentials_wait as the wait begins.
+    const events: Array<{ event: string; maxWaitMs?: unknown }> = []
+    let markWaiting!: () => void
+    const waiting = new Promise<void>((resolve) => {
+      markWaiting = resolve
+    })
+    initLogger({
+      stream: new Writable({
+        write(chunk, _enc, cb) {
+          const entry = JSON.parse(chunk.toString()) as (typeof events)[number]
+          events.push(entry)
+          if (entry.event === "fetch_credentials_wait") markWaiting()
+          cb()
+        },
+      }),
+    })
+    const lookups = () =>
+      events.filter((entry) => entry.event === "cache_miss").length
+    const controller = new AbortController()
+    let pending: Promise<Request> | undefined
+    let settled = false
+
+    try {
+      initAccounts([
+        {
+          label: "Synthetic file account",
+          source: "file",
+          configDir,
+          credentials: {
+            accessToken: "synthetic-access",
+            refreshToken: "synthetic-refresh",
+            expiresAt: Date.now() + 30_000,
+          },
+        },
+      ])
+      // Capped at 60s, which outlasts the 45s wait budget.
+      noteRefreshTransient("file", { retryAfterMs: 60_000 })
+
+      pending = prepareClaudeRequest(
+        new Request(messageRequest(), { signal: controller.signal }),
+        "fallback-token",
+        "file",
+      )
+      pending.then(
+        () => (settled = true),
+        () => (settled = true),
+      )
+      await Promise.race([waiting, pending])
+      // The wait's next lookup is at least 1.25s away, so after one more turn
+      // the request can only still be pending inside the wait.
+      await new Promise((resolve) => setImmediate(resolve))
+      assert.equal(
+        settled,
+        false,
+        "the request must be waiting for credentials",
+      )
+      assert.equal(
+        events.find((entry) => entry.event === "fetch_credentials_wait")
+          ?.maxWaitMs,
+        45_000,
+      )
+
+      const lookupsBeforeAbort = lookups()
+      controller.abort()
+      const prepared = await pending
+
+      assert.equal(
+        prepared.headers.get("authorization"),
+        "Bearer fallback-token",
+      )
+      // Ended by the abort, not by the wait budget: no lookup ran after it.
+      assert.equal(
+        lookups() - lookupsBeforeAbort,
+        0,
+        "the wait kept polling for credentials after the abort",
+      )
+      assert.equal(exchanges, 0)
+      assert.equal(existsSync(cliMarker), false)
+    } finally {
+      controller.abort()
+      if (pending) await Promise.allSettled([pending])
+      closeLogger()
+      clearRefreshOutcome("file")
+      initAccounts([])
+      globalThis.fetch = realFetch
+      if (realPath === undefined) delete process.env.PATH
+      else process.env.PATH = realPath
+      rmSync(fixtureDir, { recursive: true, force: true })
+    }
   })
 
   it("transforms the native response without sending another request", async () => {
