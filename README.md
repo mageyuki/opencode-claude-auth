@@ -1,19 +1,32 @@
-# opencode-claude-auth
+# @mageyuki/opencode-claude-auth
 
-[![npm](https://img.shields.io/npm/v/opencode-claude-auth)](https://www.npmjs.com/package/opencode-claude-auth)
-[![CI](https://github.com/griffinmartin/opencode-claude-auth/actions/workflows/ci.yml/badge.svg)](https://github.com/griffinmartin/opencode-claude-auth/actions/workflows/ci.yml)
-[![Socket Badge](https://socket.dev/api/badge/npm/package/opencode-claude-auth)](https://socket.dev/npm/package/opencode-claude-auth)
+[![CI](https://github.com/mageyuki/opencode-claude-auth/actions/workflows/ci.yml/badge.svg)](https://github.com/mageyuki/opencode-claude-auth/actions/workflows/ci.yml)
 
 Self-contained Anthropic auth provider for OpenCode 2 using your Claude Code subscription credentials — no separate login or API key needed.
 
-> **3.0.0 and later require OpenCode 2.0+ and will not load on OpenCode 1.x.** The last version that supports OpenCode 1.x is **2.2.1** — see [Migrating from OpenCode 1](#migrating-from-opencode-1).
+> **Unofficial fork.** This package is an independent fork of [`opencode-claude-auth`](https://github.com/griffinmartin/opencode-claude-auth) by [griffinmartin](https://github.com/griffinmartin). It is **not** the upstream project, is not endorsed by or affiliated with its author, and is maintained separately at [mageyuki/opencode-claude-auth](https://github.com/mageyuki/opencode-claude-auth). Report problems with this fork at its [issue tracker](https://github.com/mageyuki/opencode-claude-auth/issues), not upstream.
+
+> **Requires OpenCode 2.0+ and will not load on OpenCode 1.x.** For OpenCode 1.x, use the upstream package `opencode-claude-auth@2.2.1` instead — see [Migrating from OpenCode 1](#migrating-from-opencode-1).
 
 ## Compatibility
 
-| opencode-claude-auth | OpenCode  | Config key | Install                       |
-| -------------------- | --------- | ---------- | ----------------------------- |
-| 3.0.0+               | 2.0+ only | `plugins`  | `opencode-claude-auth@latest` |
-| 2.2.1 and earlier    | 1.x       | `plugin`   | `opencode-claude-auth@2.2.1`  |
+| Package                                | OpenCode  | Config key | Install                                |
+| -------------------------------------- | --------- | ---------- | -------------------------------------- |
+| `@mageyuki/opencode-claude-auth` 3.0.1 | 2.0+ only | `plugins`  | `@mageyuki/opencode-claude-auth@3.0.1` |
+| upstream `opencode-claude-auth` 2.2.1  | 1.x       | `plugin`   | `opencode-claude-auth@2.2.1`           |
+
+## Divergence from upstream
+
+Version 3.0.1 of this fork is upstream `opencode-claude-auth` [3.0.0](https://github.com/griffinmartin/opencode-claude-auth/tree/v3.0.0) plus:
+
+- Claude Code version update to 2.1.325, required by Fable 5.2 (upstream issue [#298](https://github.com/griffinmartin/opencode-claude-auth/issues/298)).
+- Package metadata for the scoped name (`@mageyuki/opencode-claude-auth`, repository/bugs/homepage pointing at the fork, public access).
+
+The scoped name is a separate npm package, so its version numbers do not track upstream's.
+
+For compatibility with credentials and settings already stored by upstream, the plugin id (`griffinmartin.claude-auth`) and the credential metadata key (`opencode-claude-auth/claude-code-oauth`) are intentionally unchanged. Because of this, do **not** enable this package and upstream `opencode-claude-auth` at the same time.
+
+Licensed under the MIT license of the original project; the original copyright notice is preserved in [LICENSE](LICENSE).
 
 ## How it works
 
@@ -41,7 +54,7 @@ If you run [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI), you don'
    }
    ```
 
-Remove `opencode-claude-auth` from your `plugins` list when using this setup — the two approaches shouldn't be combined. CLIProxyAPI also supports multi-account load balancing and other providers (Codex, Gemini, Grok). This plugin remains the lighter option if you only need Claude Code credentials in OpenCode with no extra service running.
+Remove `@mageyuki/opencode-claude-auth` from your `plugins` list when using this setup — the two approaches shouldn't be combined. CLIProxyAPI also supports multi-account load balancing and other providers (Codex, Gemini, Grok). This plugin remains the lighter option if you only need Claude Code credentials in OpenCode with no extra service running.
 
 ## Prerequisites
 
@@ -59,7 +72,7 @@ macOS is preferred (uses Keychain). Linux and Windows work via the credentials f
 Paste this into any LLM agent (Claude Code, OpenCode, Cursor, etc.):
 
 ```
-Install the opencode-claude-auth plugin and configure it by following: https://raw.githubusercontent.com/griffinmartin/opencode-claude-auth/main/installation.md
+Install the @mageyuki/opencode-claude-auth plugin and configure it by following: https://raw.githubusercontent.com/mageyuki/opencode-claude-auth/main/installation.md
 ```
 
 **Option B: Manual setup**
@@ -68,11 +81,11 @@ Install the opencode-claude-auth plugin and configure it by following: https://r
 
    ```json
    {
-     "plugins": ["opencode-claude-auth@latest"]
+     "plugins": ["@mageyuki/opencode-claude-auth@3.0.1"]
    }
    ```
 
-   > OpenCode 2 uses the `plugins` key (plural) — OpenCode 1 used `plugin` (singular). The `@latest` tag ensures OpenCode always pulls the newest version on startup. No manual `npm install` is needed — OpenCode [automatically installs npm plugins using Bun at startup](https://opencode.ai/docs/plugins/#how-plugins-are-installed).
+   > OpenCode 2 uses the `plugins` key (plural) — OpenCode 1 used `plugin` (singular). The version is pinned to the release `3.0.1` for reproducible installs; keep any existing plugin entries in the array unchanged. You can also run `opencode plugin add @mageyuki/opencode-claude-auth@3.0.1`. No manual `npm install` is needed — OpenCode installs package plugins itself (see the [OpenCode 2 plugins guide](https://opencode.ai/v2/docs/plugins)).
 
 2. **Connect it** — restart OpenCode, run `/connect`, choose **Anthropic**, then **Import Claude Code subscription**. Use `/models` and pick a model under **Anthropic**.
 
@@ -86,14 +99,14 @@ Run `/connect` once to import your Claude Code subscription, then use OpenCode n
 
 ## Migrating from OpenCode 1
 
-OpenCode 2 replaced the plugin and auth APIs this plugin used under OpenCode 1, so 3.0.0 and later only load on OpenCode 2.
+OpenCode 2 replaced the plugin and auth APIs this plugin used under OpenCode 1, so this fork only loads on OpenCode 2.
 
 1. Upgrade OpenCode — see the [OpenCode 2 migration guide](https://opencode.ai/v2/docs/migrate-v1).
-2. In `~/.config/opencode/opencode.json`, move the plugin from the `plugin` key (OpenCode 1) to `plugins` (OpenCode 2):
+2. In `~/.config/opencode/opencode.json`, remove the plugin from the `plugin` key (OpenCode 1) and add this fork to `plugins` (OpenCode 2):
 
    ```json
    {
-     "plugins": ["opencode-claude-auth@latest"]
+     "plugins": ["@mageyuki/opencode-claude-auth@3.0.1"]
    }
    ```
 
@@ -101,7 +114,7 @@ OpenCode 2 replaced the plugin and auth APIs this plugin used under OpenCode 1, 
 
 ### Staying on OpenCode 1
 
-**2.2.1** is the last release that supports OpenCode 1. Pin it instead of tracking `@latest`:
+This fork does not support OpenCode 1. Upstream **2.2.1** is the last release that supports it; pin the upstream package:
 
 ```json
 {
@@ -158,7 +171,7 @@ If only one account is found, the selection prompt is skipped and the plugin use
 | "Credentials are unavailable or expired"                                              | Run `claude` to refresh your Claude Code credentials                                                                                                                                                          |
 | Auth keeps failing right after re-authenticating with `claude`                        | OpenCode may still be holding a refresh token from a previous `/connect` that's now stale. The plugin re-syncs from the keychain automatically on the next refresh; if it's still stuck, run `/connect` again |
 | "Extra usage is required for long context requests"                                   | Your conversation exceeded 200k tokens. See [Long context (1M)](#long-context-1m) below                                                                                                                       |
-| Plugin not updating to latest version                                                 | Delete the cached package: `rm -rf ~/.cache/opencode/packages/opencode-claude-auth@latest/` then restart OpenCode                                                                                             |
+| Plugin not updating to a newer version                                                | The install pins an exact version, so it never moves on its own. Change the version in the `plugins` entry to the newer release and restart OpenCode                                                          |
 | `opencode auth login` prints "Only http and https links can be opened in the browser" | Harmless: importing has no browser step, but the CLI tries to open one anyway. The credential is still saved — confirm with `opencode auth list`                                                              |
 
 ### Diagnostic logging

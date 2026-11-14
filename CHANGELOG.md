@@ -1,5 +1,13 @@
 # Changelog
 
+## 3.0.1 (2026-11-14)
+
+Fork release of `@mageyuki/opencode-claude-auth` (unofficial), based on upstream `opencode-claude-auth` [3.0.0](https://github.com/griffinmartin/opencode-claude-auth/tree/v3.0.0).
+
+### Bug Fixes
+
+* update Claude Code version to 2.1.325 for Fable 5.2 ([griffinmartin/opencode-claude-auth#298](https://github.com/griffinmartin/opencode-claude-auth/issues/298))
+
 ## [3.0.0](https://github.com/griffinmartin/opencode-claude-auth/compare/v2.2.1...v3.0.0) (2026-10-16)
 
 

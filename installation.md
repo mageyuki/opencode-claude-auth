@@ -1,10 +1,12 @@
-# Install opencode-claude-auth
+# Install @mageyuki/opencode-claude-auth
 
-These instructions are designed for AI coding agents. This version requires **OpenCode 2** — it will not load on OpenCode 1. The last version that supports OpenCode 1 is **2.2.1** (see [Migrating from OpenCode 1](#migrating-from-opencode-1)).
+These instructions are designed for AI coding agents. This is an **unofficial fork** of [`opencode-claude-auth`](https://github.com/griffinmartin/opencode-claude-auth) (by griffinmartin), maintained at [mageyuki/opencode-claude-auth](https://github.com/mageyuki/opencode-claude-auth). This version requires **OpenCode 2** — it will not load on OpenCode 1. For OpenCode 1, use the upstream package `opencode-claude-auth@2.2.1` (see [Migrating from OpenCode 1](#migrating-from-opencode-1)).
+
+> Do not enable this package together with the upstream `opencode-claude-auth` package: both register the same plugin id.
 
 ## Prerequisites
 
-Before installing, verify you have OpenCode 2 and Claude Code installed and authenticated.
+Before installing, verify you have OpenCode 2 and Claude Code installed.
 
 ### Check OpenCode version
 
@@ -14,31 +16,9 @@ opencode --version
 
 You need an OpenCode 2 build. See the [OpenCode 2 migration guide](https://opencode.ai/v2/docs/migrate-v1) if you're still on an OpenCode 1 build (`1.x`).
 
-### Check Claude Code credentials (macOS)
+### Claude Code authentication
 
-```bash
-security find-generic-password -s "Claude Code-credentials" -w
-```
-
-If this returns credentials, you're authenticated. If it fails or returns nothing, try the fallback:
-
-### Check Claude Code credentials (fallback for all platforms)
-
-```bash
-cat ~/.claude/.credentials.json
-```
-
-If this file exists and contains valid JSON, you're authenticated. If `CLAUDE_CONFIG_DIR` is set, check `$CLAUDE_CONFIG_DIR/.credentials.json` instead.
-
-### If credentials don't exist
-
-Run Claude Code to authenticate:
-
-```bash
-claude
-```
-
-This will prompt you to log in and store credentials in Keychain (macOS) or `~/.claude/.credentials.json` (other platforms; `$CLAUDE_CONFIG_DIR/.credentials.json` if `CLAUDE_CONFIG_DIR` is set).
+Claude Code must already be signed in; the user does this by running `claude`. Do not read, print, copy or ask for the Claude Code credential or token files (Keychain entry, `~/.claude/.credentials.json`, `$CLAUDE_CONFIG_DIR/.credentials.json`) to check this — they contain secrets. If the user is not signed in, ask them to run `claude` themselves.
 
 ## Installation
 
@@ -46,30 +26,19 @@ This will prompt you to log in and store credentials in Keychain (macOS) or `~/.
 
 Edit the OpenCode configuration file at `~/.config/opencode/opencode.json`.
 
-Add `opencode-claude-auth@latest` to the `plugins` array:
+Add `@mageyuki/opencode-claude-auth@3.0.1` to the `plugins` array, keeping any existing plugin entries unchanged:
 
 ```json
 {
-  "plugins": ["opencode-claude-auth@latest"]
+  "plugins": ["@mageyuki/opencode-claude-auth@3.0.1"]
 }
 ```
 
 > OpenCode 2 uses the `plugins` key (plural). OpenCode 1 used `plugin` (singular).
 
-Or run this command to do it automatically:
+Do not rewrite an existing `opencode.json` automatically; edit the `plugins` array by hand and preserve unrelated settings and plugin entries. If an older `@mageyuki/opencode-claude-auth@…` entry is already present, replace it instead of adding a second one.
 
-```bash
-node -e "
-const fs = require('fs'), p = require('path').join(require('os').homedir(), '.config/opencode/opencode.json');
-const c = fs.existsSync(p) ? JSON.parse(fs.readFileSync(p,'utf8')) : {};
-c.plugins = [...new Set([...(Array.isArray(c.plugins) ? c.plugins : []), 'opencode-claude-auth@latest'])];
-fs.mkdirSync(require('path').dirname(p), {recursive:true});
-fs.writeFileSync(p, JSON.stringify(c, null, 2));
-console.log('Added opencode-claude-auth@latest to', p);
-"
-```
-
-The `@latest` tag ensures OpenCode always pulls the newest version on startup. No manual `npm install` is needed — OpenCode [automatically installs npm plugins using Bun at startup](https://opencode.ai/docs/plugins/#how-plugins-are-installed).
+The version is pinned to the release `3.0.1` so that installs are reproducible. No manual `npm install` is needed — OpenCode installs package plugins itself (see the [OpenCode 2 plugins guide](https://opencode.ai/v2/docs/plugins)); the CLI equivalent is `opencode plugin add @mageyuki/opencode-claude-auth@3.0.1`.
 
 ### Step 2: Connect it
 
@@ -85,7 +54,7 @@ Verify the plugin was added:
 cat ~/.config/opencode/opencode.json
 ```
 
-You should see `opencode-claude-auth@latest` in the `plugins` array. You can also confirm the plugin loaded with:
+You should see `@mageyuki/opencode-claude-auth@3.0.1` in the `plugins` array. You can also confirm the plugin loaded with:
 
 ```bash
 opencode plugin list
@@ -95,21 +64,17 @@ The list should contain `griffinmartin.claude-auth`.
 
 ## Upgrading
 
-If the plugin isn't picking up a new version, clear the cached package and restart OpenCode:
-
-```bash
-rm -rf ~/.cache/opencode/packages/opencode-claude-auth@latest/
-```
+The exact version stays pinned, so OpenCode does not move to a newer release on its own. To upgrade, change the version in the `@mageyuki/opencode-claude-auth@…` entry of the `plugins` array to the newer published release and restart OpenCode.
 
 ## Migrating from OpenCode 1
 
-If you were previously running this plugin under OpenCode 1, version 3.0.0 drops OpenCode 1 support entirely — it targets OpenCode 2's plugin and auth APIs, which are not compatible with OpenCode 1.
+If you were previously running upstream `opencode-claude-auth` under OpenCode 1, note that this fork (like upstream 3.0.0 and later) does not support OpenCode 1 — it targets OpenCode 2's plugin and auth APIs, which are not compatible with OpenCode 1.
 
 1. Upgrade OpenCode — see the [OpenCode 2 migration guide](https://opencode.ai/v2/docs/migrate-v1).
-2. Move `opencode-claude-auth@latest` from the `plugin` key (OpenCode 1) to the `plugins` key (OpenCode 2), as in [Step 1](#step-1-add-to-opencode-configuration).
+2. Remove `opencode-claude-auth` from the `plugin` key (OpenCode 1) and add `@mageyuki/opencode-claude-auth@3.0.1` to the `plugins` key (OpenCode 2), as in [Step 1](#step-1-add-to-opencode-configuration).
 3. The old OpenCode 1 connection isn't reused. Run `claude` if Claude Code isn't already signed in, restart OpenCode 2, then follow [Step 2](#step-2-connect-it) above to reconnect.
 
-If you still need OpenCode 1, pin **2.2.1** — the last release that supports it — instead of tracking `@latest`:
+If you still need OpenCode 1, use the upstream package pinned to **2.2.1** — the last upstream release that supports it — instead of this fork:
 
 ```json
 {
