@@ -1,31 +1,24 @@
 {
-  "name": "@mageyuki/opencode-claude-auth",
-  "version": "2.2.1",
-  "description": "Unofficial fork of opencode-claude-auth: OpenCode 2 plugin that uses your Claude Code credentials — no separate login needed.",
+  "name": "opencode-claude-auth",
+  "version": "3.0.0",
+  "description": "OpenCode 2 plugin that uses your Claude Code credentials — no separate login needed.",
   "keywords": [
     "anthropic",
     "auth",
     "claude",
-    "fork",
     "opencode",
     "plugin"
   ],
-  "homepage": "https://github.com/mageyuki/opencode-claude-auth#readme",
-  "bugs": {
-    "url": "https://github.com/mageyuki/opencode-claude-auth/issues"
-  },
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/mageyuki/opencode-claude-auth.git"
+    "url": "git+https://github.com/griffinmartin/opencode-claude-auth.git"
   },
   "files": [
     "index.js",
     "opencode-claude-auth.js",
     "dist",
-    "installation.md",
-    "LICENSE",
-    "README.md"
+    "installation.md"
   ],
   "type": "module",
   "main": "index.js",
@@ -57,9 +50,6 @@
       "import": "./dist/index.js"
     }
   },
-  "publishConfig": {
-    "access": "public"
-  },
   "scripts": {
     "build": "rm -rf dist && tsc && cp src/anthropic-prompt.txt dist/",
     "test": "node --test --experimental-strip-types src/**/*.test.ts scripts/**/*.test.ts",
@@ -73,14 +63,13 @@
     "lint": "oxlint && oxfmt --check .",
     "lint:fix": "oxlint --fix . && oxfmt --write .",
     "format": "oxfmt --write .",
-    "prepack": "npm run build",
     "prepublishOnly": "pnpm run build && pnpm run test:isolated"
   },
   "dependencies": {
-    "@opencode/plugin": "latest"
+    "@opencode/plugin": "2.0.31"
   },
   "devDependencies": {
-    "@opencode/client": "latest",
+    "@opencode/client": "2.0.31",
     "@types/node": "^25.5.0",
     "oxfmt": "0.41.0",
     "oxlint": "1.56.0",

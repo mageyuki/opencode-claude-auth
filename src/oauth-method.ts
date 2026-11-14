@@ -5,11 +5,18 @@ import {
   getCachedCredentials,
   loadPersistedAccountSource,
   refreshAccountsList,
-  refreshIfNeeded,
+  refreshViaOAuth,
+  reloadCredentialsFromSource,
+  rotateAccountCredentials,
   saveAccountSource,
   setActiveAccountSource,
 } from "./credentials.ts"
-import { type ClaudeAccount, type ClaudeCredentials } from "./keychain.ts"
+import {
+  refreshAccount,
+  writeBackCredentials,
+  type ClaudeAccount,
+  type ClaudeCredentials,
+} from "./keychain.ts"
 import { log } from "./logger.ts"
 
 export const INTEGRATION_ID: Integration.ID = Integration.ID.make("anthropic")
@@ -35,14 +42,26 @@ export interface OAuthDeps {
   refreshAccountsList: () => ClaudeAccount[]
   loadPersistedAccountSource: () => string | null
   getCachedCredentials: () => Promise<ClaudeCredentials | null>
-  getAccountBySource: (source: string) => ClaudeAccount | null
-  refreshIfNeeded: (
-    account: ClaudeAccount,
-    thresholdMs?: number,
-    ownSourceOnly?: boolean,
-  ) => Promise<ClaudeCredentials | null>
   setActiveAccountSource: (source: string) => void
   saveAccountSource: (source: string) => void
+  reloadCredentialsFromSource: () => ClaudeCredentials | null
+  /** Raw read of the account's store, without the usable-expiry check. */
+  readStoredCredentials: (
+    source: string,
+    configDir: string | undefined,
+  ) => ClaudeCredentials | null
+  getAccountBySource: (source: string) => ClaudeAccount | null
+  /** Single-flight, lock-guarded rotation that also persists the result. */
+  rotateAccountCredentials: (
+    account: ClaudeAccount,
+  ) => Promise<ClaudeCredentials | null>
+  refreshViaOAuth: (refreshToken: string) => Promise<ClaudeCredentials | null>
+  writeBackCredentials: (
+    source: string,
+    creds: ClaudeCredentials,
+    configDir: string | undefined,
+    expectedPriorAccessToken: string,
+  ) => boolean
   log: (event: string, data?: Record<string, unknown>) => void
 }
 
@@ -113,13 +132,7 @@ export async function buildOAuthCredential(
     )
   deps.setActiveAccountSource(account.source)
   deps.saveAccountSource(account.source)
-  // Request caches may contain a sibling's loan. Only source-owned results
-  // may become durable connection credentials, including initial /connect.
-  const value = await deps.refreshIfNeeded(account, 60_000, true)
-  if (!value || value.expiresAt <= Date.now())
-    throw new Error(
-      "Claude OAuth import failed. Run `claude` to re-authenticate.",
-    )
+  const value = (await deps.getCachedCredentials()) ?? account.credentials
   return Credential.OAuth.make({
     type: "oauth",
     methodID: METHOD_ID,
@@ -155,7 +168,6 @@ export interface RefreshableCredential {
   readonly type: "oauth"
   readonly access: string
   readonly refresh: string
-  readonly expires: number
   readonly metadata?: Record<string, unknown>
 }
 
@@ -167,51 +179,83 @@ export async function refreshOAuthCredential(
     typeof value.metadata?.source === "string"
       ? value.metadata.source
       : undefined
-  if (!source)
-    throw new Error(
-      "Claude OAuth refresh needs an account source. Reconnect Claude Code.",
-    )
+  const configDir =
+    typeof value.metadata?.configDir === "string"
+      ? value.metadata.configDir
+      : undefined
 
-  // Never change the process-wide active account for a connection refresh.
-  // When the account has disappeared from the in-memory list, the connection
-  // still supplies its own source and credentials for a source-specific re-read.
-  const account: ClaudeAccount = deps.getAccountBySource(source) ?? {
-    label:
-      typeof value.metadata?.label === "string" ? value.metadata.label : source,
-    source,
-    ...(typeof value.metadata?.configDir === "string"
-      ? { configDir: value.metadata.configDir }
-      : {}),
-    credentials: {
-      accessToken: value.access,
-      refreshToken: value.refresh,
-      expiresAt: value.expires,
-    },
+  // OpenCode persists whatever this returns and replays that same value on
+  // every future refresh, forever, until we return something different. If
+  // `claude` has since rotated credentials independently of this connection
+  // (a fresh interactive login, its own periodic refresh, ...), the stored
+  // refresh token goes permanently stale and every refresh fails with
+  // invalid_grant even though a working credential is sitting in the
+  // keychain right now. The keychain is the real source of truth, so check
+  // it before ever attempting a network refresh with a token that may
+  // already be dead.
+  if (source) deps.setActiveAccountSource(source)
+  const fresh = deps.reloadCredentialsFromSource()
+  if (fresh && fresh.refreshToken !== value.refresh) {
+    deps.log("refresh_resynced_from_keychain", { source })
+    return Credential.OAuth.make({
+      ...value,
+      methodID: METHOD_ID,
+      access: fresh.accessToken,
+      refresh: fresh.refreshToken,
+      expires: fresh.expiresAt,
+    })
   }
-  // The coordinator may lend credentials to request callers. Its source-only
-  // mode also filters shared in-flight results and already-borrowed state.
-  const refreshed = await deps.refreshIfNeeded(account, 5 * 60_000, true)
-  // A transient outage or refresh cooldown must not invalidate a token that
-  // remains usable. Never claim an expired token is valid or extend its expiry.
-  const usable =
-    refreshed ??
-    (value.expires > Date.now()
-      ? {
-          accessToken: value.access,
-          refreshToken: value.refresh,
-          expiresAt: value.expires,
-        }
-      : null)
-  if (!usable || usable.expiresAt <= Date.now())
+
+  // An account the plugin tracks is also refreshed by the request path. Rotate
+  // it through that same single-flight, cross-process-locked refresh: two
+  // independent exchanges of one refresh token would leave one side holding
+  // a token the other already spent.
+  const account = source ? deps.getAccountBySource(source) : null
+  if (account) {
+    const rotated = await deps.rotateAccountCredentials(account)
+    if (!rotated)
+      throw new Error(
+        "Claude OAuth refresh failed. Run `claude` to re-authenticate.",
+      )
+    return Credential.OAuth.make({
+      ...value,
+      methodID: METHOD_ID,
+      access: rotated.accessToken,
+      refresh: rotated.refreshToken,
+      expires: rotated.expiresAt,
+    })
+  }
+
+  // The reload above rejects a store whose access token is about to expire,
+  // but its refresh token can still be newer than ours: after a sleep past
+  // expiry, `claude` may have rotated it while our copy is already dead.
+  // Refresh with the stored token and compare-and-swap against the stored
+  // access token so the store receives the rotation.
+  let stored: ClaudeCredentials | null = null
+  try {
+    if (source) stored = deps.readStoredCredentials(source, configDir)
+  } catch {
+    // A locked or denied keychain leaves our own token as the only candidate.
+  }
+  const current = stored?.refreshToken
+    ? stored
+    : { accessToken: value.access, refreshToken: value.refresh }
+  if (current.refreshToken !== value.refresh)
+    deps.log("refresh_using_stored_refresh_token", { source })
+
+  const refreshed = await deps.refreshViaOAuth(current.refreshToken)
+  if (!refreshed)
     throw new Error(
       "Claude OAuth refresh failed. Run `claude` to re-authenticate.",
     )
+  if (source)
+    deps.writeBackCredentials(source, refreshed, configDir, current.accessToken)
   return Credential.OAuth.make({
     ...value,
     methodID: METHOD_ID,
-    access: usable.accessToken,
-    refresh: usable.refreshToken,
-    expires: usable.expiresAt,
+    access: refreshed.accessToken,
+    refresh: refreshed.refreshToken,
+    expires: refreshed.expiresAt,
   })
 }
 
@@ -228,9 +272,13 @@ export const realOAuthDeps: OAuthDeps = {
   refreshAccountsList,
   loadPersistedAccountSource,
   getCachedCredentials,
-  getAccountBySource,
-  refreshIfNeeded,
   setActiveAccountSource,
   saveAccountSource,
+  reloadCredentialsFromSource,
+  readStoredCredentials: refreshAccount,
+  getAccountBySource,
+  rotateAccountCredentials,
+  refreshViaOAuth,
+  writeBackCredentials,
   log,
 }
